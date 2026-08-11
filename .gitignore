@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+llm_widget.json
+tools/
