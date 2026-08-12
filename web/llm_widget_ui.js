@@ -100,6 +100,7 @@ const TEXT = {
     save: "Save",
     close: "Close",
     saved: "Settings saved",
+    discard: "The settings have been changed but not saved.\n\nClose and discard the changes?",
     loadFailed: "Could not load the settings",
     failed: "LLM Widget",
     cancelled: "Generation stopped",
@@ -689,15 +690,43 @@ async function openSettings() {
     overlay.append(dialog);
     document.body.append(overlay);
 
+    const formValues = () => ({
+        api_format: apiFormat.value,
+        api_url: apiUrl.value,
+        api_key: apiKey.value,
+        model: model.value,
+        read_media: readMedia.checked,
+        thinking: thinking.value,
+        temperature: temperature.value,
+        max_length: maxLength.value,
+        gguf_model: ggufModel.value,
+        gguf_mmproj: ggufMmproj.value,
+        gguf_context: ggufContext.value,
+        gguf_gpu_layers: ggufGpuLayers.value,
+        gguf_unload_after: ggufUnload.checked,
+        gguf_describe_media: ggufDescribe.checked,
+    });
+    // Compared through normalizeSettings so the number inputs' string values and
+    // a clamped-away edit do not count as a change.
+    const pristine = JSON.stringify(normalizeSettings(formValues()));
+    const isDirty = () => JSON.stringify(normalizeSettings(formValues())) !== pristine;
+
     const close = () => {
         document.removeEventListener("keydown", onKeyDown, true);
         overlay.remove();
         settingsModal = null;
     };
+    /** Closing by ×, Escape or the backdrop asks first when nothing was saved. */
+    const requestClose = () => {
+        const ask = globalThis.confirm;
+        // A host without window.confirm must not trap the dialog open.
+        if (isDirty() && typeof ask === "function" && !ask.call(globalThis, TEXT.discard)) return;
+        close();
+    };
     const onKeyDown = (event) => {
         if (event.key === "Escape") {
             event.preventDefault();
-            close();
+            requestClose();
         }
     };
     settingsModal = { dialog, close };
@@ -706,31 +735,16 @@ async function openSettings() {
         for (const select of [apiFormat, thinking, ggufModel, ggufMmproj]) {
             if (!select.contains?.(event.target)) select.closeMenu?.();
         }
-        if (event.target === overlay) close();
+        if (event.target === overlay) requestClose();
     });
-    closeButton.addEventListener("click", close);
+    closeButton.addEventListener("click", requestClose);
     form.addEventListener("submit", async (event) => {
         event.preventDefault();
         if (saveButton.disabled) return;
         saveButton.disabled = true;
         error.hidden = true;
         try {
-            await saveSettings({
-                api_format: apiFormat.value,
-                api_url: apiUrl.value,
-                api_key: apiKey.value,
-                model: model.value,
-                read_media: readMedia.checked,
-                thinking: thinking.value,
-                temperature: temperature.value,
-                max_length: maxLength.value,
-                gguf_model: ggufModel.value,
-                gguf_mmproj: ggufMmproj.value,
-                gguf_context: ggufContext.value,
-                gguf_gpu_layers: ggufGpuLayers.value,
-                gguf_unload_after: ggufUnload.checked,
-                gguf_describe_media: ggufDescribe.checked,
-            });
+            await saveSettings(formValues());
             notify(TEXT.saved, "success");
             close();
         } catch (saveError) {
@@ -863,8 +877,10 @@ function installToolbar(node) {
     media.className = "llmw-media";
     media.hidden = true;
 
-    bar.append(runButton, status, copyButton, settingsButton);
-    wrap.append(bar, media);
+    // The status stretches so the buttons stay together in the bottom-right
+    // corner of the node, with the run button in the corner itself.
+    bar.append(status, settingsButton, copyButton, runButton);
+    wrap.append(media, bar);
     // The canvas would otherwise zoom while the pointer sits over the toolbar.
     wrap.addEventListener("wheel", (event) => {
         event.preventDefault();
@@ -889,13 +905,8 @@ function installToolbar(node) {
     node.__llmwStatus = status;
     node.__llmwMedia = media;
     node.__llmwToolbar = widget;
-    // Added last but belongs first: the run button should not scroll away
-    // behind three text areas.
-    const index = node.widgets.indexOf(widget);
-    if (index > 0) {
-        node.widgets.splice(index, 1);
-        node.widgets.unshift(widget);
-    }
+    // Added last and left there: the toolbar belongs under the answer field, so
+    // the run and copy buttons sit at the node's bottom-right corner.
     syncNode(node);
 }
 

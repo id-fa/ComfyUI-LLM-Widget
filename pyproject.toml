@@ -3,7 +3,7 @@ name = "llm-widget"
 description = "A standalone LLM widget node for ComfyUI: ask a local GGUF or an OpenAI/Gemini-compatible API a question about a connected image or video, without running the graph."
 version = "0.1.0"
 license = { file = "LICENSE" }
-dependencies = []
+dependencies = ["llama-cpp-python", "gguf"]
 
 [project.urls]
 Repository = "https://github.com/id-fa/ComfyUI-LLM-Widget"

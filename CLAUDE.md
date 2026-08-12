@@ -121,7 +121,9 @@ code. This is a deliberate divergence from the MiniMax H3 optimizer, which alway
 `system_prompt`, `question` and `answer` are ordinary ComfyUI multiline `STRING` widgets. They are
 **not** replaced by DOM widgets: the native textarea already handles IME composition (this pack's
 author writes Japanese), resizing and undo. The only DOM widget is the toolbar, which is added last
-and then spliced to index 0 of `node.widgets` so the run button never scrolls away.
+and stays last, under the answer field, so the run and copy buttons sit in the node's bottom-right
+corner where the eye ends up after reading the answer. Inside the row the status label stretches and
+the buttons are right-aligned; the media chips sit above the button row.
 
 `setWidgetText` writes `widget.value`, `widget.element.value` and `widget.inputEl.value` and calls
 the callback, because which of those a multiline widget actually reads differs across ComfyUI
