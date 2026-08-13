@@ -84,8 +84,9 @@ C:\AI\ComfyUI\python_embeded\python.exe -c "from llama_cpp.llama_chat_format imp
 
 ウィジェット:
 
-- **toolbar** — ✦ 実行（リクエスト中は ■ 停止に変わる）、経過時間、⧉ 答えをコピー、⚙ 設定。
-  その上には、接続したメディアごとに実際に送られるものを示すチップが並びます。
+- **toolbar** — ✦ 実行（リクエスト中は ■ 停止に変わる）、経過時間、⏏ モデルを解放（Gemini 以外で
+  表示）、⧉ 答えをコピー、⚙ 設定。その上には、接続したメディアごとに実際に送られるものを示す
+  チップが並びます。
 - **system_prompt** — 自由記述。ワークフローと一緒に保存されます。「テンプレート」と呼べるものは
   これだけです。
 - **question** — 質問内容。
@@ -138,7 +139,7 @@ Reroute ノードは辿って追跡します。
 | Model thinking | 全て | `Off`（既定）または `Keep` — *推論（thinking）* を参照 |
 | Temperature | 全て | |
 | Max answer tokens | 全て | ローカルバックエンドでは `max_tokens`。答えの長さの上限 |
-| Unload after answering | gguf | モデルを常駐させず、すぐに VRAM を解放 |
+| Unload after answering | gguf | モデルを常駐させず、すぐに VRAM を解放。オフのままでもツールバーの ⏏ でいつでも解放できます |
 | Send the connected image / video | 全て | オフにすると質問は純粋なテキストとして送られます |
 | Describe each media in its own pass | gguf | 下記参照 |
 
@@ -159,6 +160,37 @@ Reroute ノードは辿って追跡します。
 キャンセル後に届いた HTTP の答えは破棄されます。モデルのロードと llama-cpp のプロンプト評価は
 依然として中断できません。
 
+### モデルの解放（⏏）
+
+グラフを流す前に VRAM を返したいときのための明示的なボタンです。何をするかはバックエンドで
+変わります。
+
+**gguf** — GGUF は次の質問で再ロードしなくて済むように常駐します。`Unload after answering` を
+オフにしている場合、⏏ がそれを解放する手段です。生成中は ⏏ が無効になり、サーバー側も実行中の
+解放要求を拒否します — 生成中の `Llama` を閉じると llama-cpp ごと落ちるためです。
+
+**openai** — ローカルサーバーに解放を依頼します。宛先は設定の API URL から導出します
+（`http://127.0.0.1:1234/v1/chat/completions` → `http://127.0.0.1:1234`）。どのサーバーかは
+**設定させず、常駐モデルの一覧で自動判別**します:
+
+| | 一覧（判別に使用） | 解放 |
+|---|---|---|
+| LM Studio | `GET /api/v1/models` の `loaded_instances` | `POST /api/v1/models/unload` に `instance_id` |
+| Ollama | `GET /api/ps` | `POST /api/generate` に `{"model": …, "keep_alive": 0}` |
+
+互いに相手のパスを持たないので、どちらが応答したかがそのまま判別になります。解放するのは
+設定した Model に一致するものだけです。タグは両側で省略可能に扱うので、`llama3.2` は
+`llama3.2:latest` に一致し、LM Studio の 2 つめのインスタンス `key:2` にも一致します。一致
+しなければ何もせず、実際にロードされているモデル名を返します。
+
+どちらも応答しなければ（素の llama.cpp サーバー、クラウドのエンドポイント）その旨を表示します。
+クラウドでは元より意味がありませんが、ボタンは出したままにしてあります。
+
+なお、この判別のためだけに API format を Ollama / LM Studio / その他に分けてはいません。生成の
+経路はどれも同じ `/v1/chat/completions` で、ボタン 1 つのために設定を三重化する価値がないためです。
+
+**gemini** — 解放するものが無いのでボタン自体を出しません。
+
 ### 推論（thinking）
 
 **Model thinking = Off**（既定）のとき、リクエストには各バックエンドが解釈できるスイッチが
@@ -170,8 +202,10 @@ Gemini には `thinkingConfig.thinkingBudget=0`、Qwen 系には `/no_think`、l
 それでもモデルが吐いてしまったものは後処理で除去します。最後の `</think>` までが、その閉じタグ
 自体も含めて削除されます。閉じタグだけを手掛かりにしているのは意図的です。ほとんどの Qwen の
 チャットテンプレートは assistant ターンで `<think>` を あらかじめ開いて いるため、返ってくる
-テキストは裸の推論文から始まり、開始タグはレスポンスに含まれません。Harmony 形式の
-`<|channel|>final<|message|>` マーカーも同様に扱います。
+テキストは裸の推論文から始まり、開始タグはレスポンスに含まれません。タグではなく channel
+マーカーを使うモデルも同様に扱います。Harmony 形式の `<|channel|>final<|message|>` に加えて、
+パイプが片側だけの綴り（Gemma 4 の `<|channel>thought` … `<channel|>` のように、開始と閉じで
+向きが変わるもの）も、最後のマーカーまでを推論として落とします。
 
 マーカーが一切ない 推論（「Here's a thinking process: 1. Analyze user input…」がただの平文で
 続くもの）は答えと分離できません。どこで終わるのかを示すものが何もないからです。スイッチを
@@ -284,9 +318,9 @@ it back with `pip install --upgrade "numpy<2.3"` (same idea for `"pillow<12"`).
 
 Widgets:
 
-- **toolbar** — ✦ run (becomes ■ stop while a request is in flight), elapsed time, ⧉ copy
-  the answer, ⚙ settings. Above it, a chip per connected media shows what will actually be
-  sent.
+- **toolbar** — ✦ run (becomes ■ stop while a request is in flight), elapsed time, ⏏ unload
+  the model (shown for every backend but Gemini), ⧉ copy the answer, ⚙ settings. Above it, a
+  chip per connected media shows what will actually be sent.
 - **system_prompt** — free text, saved with the workflow. This is the only "template"
   there is.
 - **question** — what you are asking.
@@ -336,7 +370,7 @@ API key** and is gitignored.
 | Model thinking | all | `Off` (default) or `Keep` — see *Reasoning* |
 | Temperature | all | |
 | Max answer tokens | all | `max_tokens` for the local backends, the answer length cap |
-| Unload after answering | gguf | Frees VRAM immediately instead of keeping the model resident |
+| Unload after answering | gguf | Frees VRAM immediately instead of keeping the model resident. Leave it off and use the toolbar's ⏏ when you want the VRAM back |
 | Send the connected image / video | all | Off means the question is asked as pure text |
 | Describe each media in its own pass | gguf | See below |
 
@@ -358,6 +392,39 @@ While a request is running the ✦ button becomes ■. Pressing it aborts the br
 HTTP answer that arrives after a cancel is discarded. Model loading and llama-cpp's prompt
 evaluation still cannot be interrupted.
 
+### Unloading the model (⏏)
+
+The explicit way to hand VRAM back before queueing the graph. What it does depends on the
+backend.
+
+**gguf** — a GGUF stays resident so the next question does not reload it, and with `Unload
+after answering` off nothing ever frees it. ⏏ does. It is disabled while a generation is
+running and the server refuses the request too: closing a `Llama` that is still generating
+takes llama-cpp down with it.
+
+**openai** — asks the local server to free it. The address comes from the configured API URL
+(`http://127.0.0.1:1234/v1/chat/completions` → `http://127.0.0.1:1234`). Which server it is
+**is detected rather than configured**, by asking what it has resident:
+
+| | Listing (the detection) | Unload |
+|---|---|---|
+| LM Studio | `GET /api/v1/models` → `loaded_instances` | `POST /api/v1/models/unload` with `instance_id` |
+| Ollama | `GET /api/ps` | `POST /api/generate` with `{"model": …, "keep_alive": 0}` |
+
+Neither server has the other's route, so whichever answers *is* the answer. Only models
+matching the configured Model are unloaded, with the tag optional on both sides: `llama3.2`
+matches `llama3.2:latest`, and a second LM Studio instance's `key:2` matches its key. If
+nothing matches, nothing is unloaded and the reply says what *is* resident.
+
+If neither answers — a plain llama.cpp server, a cloud endpoint — it says so. Pointless
+against the cloud, but the button is left visible anyway.
+
+The API format is deliberately *not* split into Ollama / LM Studio / other for this: every one
+of them generates through the same `/v1/chat/completions`, and tripling the settings for one
+button is not worth it.
+
+**gemini** — nothing to free, so the button is not shown.
+
 ### Reasoning
 
 With **Model thinking = Off** (the default) the request carries every switch the backends
@@ -369,8 +436,10 @@ unknown field gets the request again without it, so a stricter API still answers
 Whatever a model emits anyway is cleaned up afterwards: everything up to and including the
 **last** closing `</think>` is removed. The closing tag alone is enough on purpose — most
 Qwen chat templates *pre-open* `<think>` in the assistant turn, so what comes back starts
-with bare reasoning prose and the opening tag is never in the response. Harmony-style
-`<|channel|>final<|message|>` markers are handled the same way.
+with bare reasoning prose and the opening tag is never in the response. Models that mark
+their reasoning with channels instead of tags are handled the same way: Harmony's
+`<|channel|>final<|message|>`, and the half-piped spellings too — Gemma 4 opens with
+`<|channel>thought` and closes with `<channel|>`, and everything up to that last marker goes.
 
 Reasoning that carries **no marker at all** ("Here's a thinking process: 1. Analyze user
 input…" as plain text) cannot be separated from the answer — nothing says where it stops.

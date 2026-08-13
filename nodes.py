@@ -54,6 +54,9 @@ THINKING_KEEP = "keep"
 THINKING_MODES = (THINKING_OFF, THINKING_KEEP)
 
 HTTP_TIMEOUT_SECONDS = 600
+# Freeing a model is quick; a request that hangs here should not sit for the ten
+# minutes a generation is allowed.
+UNLOAD_TIMEOUT_SECONDS = 60
 HTTP_MAX_OUTPUT_TOKENS = 50000
 MAX_LENGTH_DEFAULT = 1024
 MAX_LENGTH_MIN = 16
@@ -385,8 +388,20 @@ _THINK_TAGS = "think|thinking|reasoning|thought|analysis"
 # Requiring the opening tag let that whole reasoning block through.
 _THINK_CLOSE_RE = re.compile(rf"\A.*</(?:{_THINK_TAGS})>", flags=re.I | re.S)
 _OPEN_THINK_RE = re.compile(rf"\A\s*<(?:{_THINK_TAGS})>", flags=re.I)
-# Harmony-style channel markers (gpt-oss and friends) put the answer last.
-_FINAL_CHANNEL_RE = re.compile(r"\A.*<\|channel\|>final<\|message\|>", flags=re.I | re.S)
+# Channel markers instead of tags. gpt-oss writes Harmony's `<|channel|>`, but the
+# pipes move: Gemma 4 opens with `<|channel>thought` and closes with `<channel|>`,
+# so every spelling of the same marker has to be accepted.
+_CHANNEL_MARK = r"<\|?channel\|?>"
+_MESSAGE_MARK = r"<\|?message\|?>"
+# Both are greedy: the answer is whatever follows the LAST marker.
+_FINAL_CHANNEL_RE = re.compile(rf"\A.*{_CHANNEL_MARK}\s*final\s*{_MESSAGE_MARK}", flags=re.I | re.S)
+# A thinking channel that is closed by a bare marker, with no `final` role and no
+# `<|message|>` after it — the answer simply starts there.
+_THOUGHT_CHANNEL_RE = re.compile(
+    rf"\A.*{_CHANNEL_MARK}\s*(?:{_THINK_TAGS})\b.*{_CHANNEL_MARK}\s*(?:{_MESSAGE_MARK})?",
+    flags=re.I | re.S,
+)
+_OPEN_CHANNEL_RE = re.compile(rf"\A\s*{_CHANNEL_MARK}\s*(?:{_THINK_TAGS})\b", flags=re.I)
 _TRAILING_TOKEN_RE = re.compile(r"<\|(?:return|end|endoftext|im_end)\|>\s*\Z", flags=re.I)
 _WHOLE_FENCE_RE = re.compile(r"\A```([A-Za-z0-9_+.-]*)[ \t]*\r?\n(.*?)\r?\n?```\Z", flags=re.S)
 # Fences that only wrap prose are unwrapped; a ```python block is the answer
@@ -408,9 +423,10 @@ def _clean_output(text: Any, strip_thinking: bool = True) -> str:
     value = str(text or "").strip()
     if strip_thinking:
         value = _FINAL_CHANNEL_RE.sub("", value).strip()
+        value = _THOUGHT_CHANNEL_RE.sub("", value).strip()
         value = _TRAILING_TOKEN_RE.sub("", value).strip()
         value = _THINK_CLOSE_RE.sub("", value).strip()
-        if _OPEN_THINK_RE.match(value):
+        if _OPEN_THINK_RE.match(value) or _OPEN_CHANNEL_RE.match(value):
             # An unterminated block means the answer was cut off mid-thought,
             # so there is no answer in here at all.
             return ""
@@ -719,6 +735,168 @@ def _http_post(
     raise last or RuntimeError("Request failed")
 
 
+def _server_root(api_url: str) -> str:
+    """The server root an OpenAI-compatible URL hangs off.
+
+    A local server's own management API sits *beside* the OpenAI-compatible one
+    — under `/api/v1` for LM Studio, `/api` for Ollama — so the
+    `/v1/chat/completions` part has to come off first. Only the API path is
+    removed, not the whole path: a reverse proxy that serves the server under a
+    prefix keeps it.
+    """
+    base = _strip_known_endpoint(_normalize_base_url(api_url))
+    lower = base.lower()
+    for suffix in ("/api/v1", "/api/v0", "/v1beta", "/v1"):
+        if lower.endswith(suffix):
+            return base[: -len(suffix)].rstrip("/")
+    return base
+
+
+def _api_request(url: str, headers: Mapping[str, str], payload: Any = None, method: str = "GET") -> Any:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(url, data=data, headers=dict(headers), method=method)
+    with urllib.request.urlopen(request, timeout=UNLOAD_TIMEOUT_SECONDS) as response:
+        body = response.read().decode("utf-8", errors="replace")
+    return json.loads(body) if body.strip() else {}
+
+
+def _lmstudio_instances(root: str, headers: Mapping[str, str]) -> list[tuple[str, str]] | None:
+    """`(model key, instance id)` for everything the server has resident.
+
+    None means the question could not be asked — an older LM Studio, a llama.cpp
+    server, a cloud endpoint. The caller then tries the unload blind rather than
+    giving up, because the error from that call is the informative one.
+    """
+    try:
+        data = _api_request(f"{root}/api/v1/models", headers)
+    except Exception:
+        return None
+    models = data.get("models") if isinstance(data, Mapping) else None
+    if not isinstance(models, list):
+        return None
+    loaded: list[tuple[str, str]] = []
+    for entry in models:
+        if not isinstance(entry, Mapping):
+            continue
+        key = str(entry.get("key") or entry.get("id") or "")
+        for instance in entry.get("loaded_instances") or []:
+            if isinstance(instance, Mapping) and instance.get("id"):
+                loaded.append((key, str(instance["id"])))
+    return loaded
+
+
+def _ollama_running(root: str, headers: Mapping[str, str]) -> list[str] | None:
+    """The model names Ollama currently has in memory, or None if that is not it.
+
+    `/api/ps` is Ollama's and `/api/v1/models` is LM Studio's; neither server has
+    the other's route, so which one answers *is* the detection. Both are plain
+    reads, so probing costs nothing but a local round trip.
+    """
+    try:
+        data = _api_request(f"{root}/api/ps", headers)
+    except Exception:
+        return None
+    models = data.get("models") if isinstance(data, Mapping) else None
+    if not isinstance(models, list):
+        return None
+    return [
+        str(entry.get("model") or entry.get("name"))
+        for entry in models
+        if isinstance(entry, Mapping) and (entry.get("model") or entry.get("name"))
+    ]
+
+
+def _same_model(configured: str, name: str) -> bool:
+    """Whether a resident model is the configured one.
+
+    The tag is optional on both sides: Ollama reports `llama3.2:latest` for what
+    the settings call `llama3.2`, and LM Studio gives a second instance of a
+    model the id `key:2`.
+    """
+    left = configured.strip().lower()
+    right = str(name).strip().lower()
+    if not left or not right:
+        return False
+    return left == right or right.startswith(f"{left}:") or left.startswith(f"{right}:")
+
+
+def _not_loaded(model: str, resident: Sequence[str]) -> tuple[int, str]:
+    listed = ", ".join(sorted({str(name) for name in resident if name}))
+    return 0, f"{model} is not loaded" + (f" (loaded: {listed})" if listed else "")
+
+
+def _remote_unload(settings: Mapping[str, Any]) -> tuple[int, str]:
+    """Unload the configured model from whichever local server is behind the URL.
+
+    Only local servers have anything to free, and the two that people actually
+    run this against say so in their own way: LM Studio through
+    `/api/v1/models/unload`, Ollama by asking for a generation with
+    `keep_alive: 0`. Which is which is answered by the listing probes rather than
+    by a setting — the two backends are the same OpenAI-compatible endpoint for
+    every other purpose, and making the user declare the vendor for one button is
+    not worth a third API format.
+    """
+    model = str(settings.get("model") or "").strip()
+    root = _server_root(str(settings.get("api_url") or ""))
+    api_key = str(settings.get("api_key") or "")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if not model:
+        raise ValueError("Set the model in the settings first")
+
+    instances = _lmstudio_instances(root, headers)
+    if instances is not None:
+        targets = [
+            instance for key, instance in instances
+            if _same_model(model, instance) or _same_model(model, key)
+        ]
+        if not targets:
+            return _not_loaded(model, [instance for _, instance in instances])
+        return _unload_each(
+            root, headers, targets,
+            lambda instance: (f"{root}/api/v1/models/unload", {"instance_id": instance}),
+        ), ""
+
+    running = _ollama_running(root, headers)
+    if running is not None:
+        targets = [name for name in running if _same_model(model, name)]
+        if not targets:
+            return _not_loaded(model, running)
+        # An empty prompt with keep_alive 0 is how Ollama is told to drop a model;
+        # there is no dedicated route for it.
+        return _unload_each(
+            root, headers, targets,
+            lambda name: (f"{root}/api/generate", {"model": name, "keep_alive": 0}),
+        ), ""
+
+    raise RuntimeError(
+        "This server has no unload endpoint. Freeing a model is LM Studio's "
+        "(/api/v1/models/unload) or Ollama's (keep_alive 0); neither answered at "
+        f"{root}, and plain OpenAI-compatible servers have nothing of the kind."
+    )
+
+
+def _unload_each(root: str, headers: Mapping[str, str], targets: Sequence[str], build) -> int:
+    unloaded = 0
+    for target in targets:
+        url, payload = build(target)
+        try:
+            _api_request(url, headers, payload, method="POST")
+        except urllib.error.HTTPError as exc:
+            # The server listed this model moments ago, so a 404 now means it is
+            # already gone — which is the wanted end state either way.
+            if exc.code == 404:
+                continue
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Unload failed ({exc.code}): {detail[:500]}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Request failed: {exc.reason}") from exc
+        _log("unloaded %s from %s", target, root)
+        unloaded += 1
+    return unloaded
+
+
 def _http_generate(
     settings: Mapping[str, Any],
     system_prompt: str,
@@ -918,6 +1096,16 @@ def _gguf_chat_handler(model_name: str, mmproj_path: str):
 
 _GGUF_LOCK = threading.RLock()
 _GGUF_STATE: dict[str, Any] = {"signature": None, "llm": None, "vision": False}
+# How many runs are inside the local backend right now. The Unload button can
+# arrive from the editor at any moment, and closing a `Llama` that a worker
+# thread is still generating with takes llama-cpp down with it.
+_GGUF_BUSY = 0
+
+
+def _gguf_hold(delta: int) -> None:
+    global _GGUF_BUSY
+    with _GGUF_LOCK:
+        _GGUF_BUSY = max(0, _GGUF_BUSY + delta)
 
 
 def _gguf_release() -> None:
@@ -938,6 +1126,23 @@ def _gguf_release() -> None:
             comfy.model_management.soft_empty_cache()
         except Exception:
             pass
+
+
+def _gguf_unload_now() -> str:
+    """Free the cached model on request. Returns `busy`, `idle` or `unloaded`.
+
+    The whole decision happens under the lock, `llm.close()` included: checking
+    and then releasing would leave a window for a run to start in between and
+    have its model closed underneath it. `_gguf_hold` takes the same lock, so a
+    run that starts here simply waits and then loads its own.
+    """
+    with _GGUF_LOCK:
+        if _GGUF_BUSY > 0:
+            return "busy"
+        if _GGUF_STATE.get("llm") is None:
+            return "idle"
+        _gguf_release()
+    return "unloaded"
 
 
 def _gguf_model(settings: Mapping[str, Any], want_vision: bool):
@@ -1219,16 +1424,24 @@ def _generate(
     """
     api_format = str(settings.get("api_format") or FORMAT_OPENAI).lower()
     local = api_format == FORMAT_GGUF
-    describe = local and _as_bool(settings.get("gguf_describe_media")) and bool(media_items)
-    described, described_count = "", 0
-    if describe:
-        described, described_count = _gguf_describe(settings, media_items, should_stop)
-    attached = [] if describe else [item for item in media_items if item.get("parts")]
-    media_parts = [part for item in attached for part in item["parts"]]
-    system = _system_prompt(system_prompt, attached, described_count)
+    # Held for the whole local run, describe pass included, so an Unload pressed
+    # mid-generation is refused instead of freeing a model that is in use.
     if local:
-        return _gguf_generate(settings, system, question, media_parts, should_stop, described, describe)
-    return _http_generate(settings, system, question, media_parts)
+        _gguf_hold(1)
+    try:
+        describe = local and _as_bool(settings.get("gguf_describe_media")) and bool(media_items)
+        described, described_count = "", 0
+        if describe:
+            described, described_count = _gguf_describe(settings, media_items, should_stop)
+        attached = [] if describe else [item for item in media_items if item.get("parts")]
+        media_parts = [part for item in attached for part in item["parts"]]
+        system = _system_prompt(system_prompt, attached, described_count)
+        if local:
+            return _gguf_generate(settings, system, question, media_parts, should_stop, described, describe)
+        return _http_generate(settings, system, question, media_parts)
+    finally:
+        if local:
+            _gguf_hold(-1)
 
 
 def _validate(settings: Mapping[str, Any]) -> str:
@@ -1303,6 +1516,39 @@ def _register_routes() -> bool:
                 "mmproj": sorted(projectors),
                 "roots": _gguf_roots(),
             })
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+    @routes.post(f"{ROUTE_PREFIX}/unload")
+    async def _unload_route(request):
+        """Free the model the configured backend is holding.
+
+        For gguf that is this process's own cache; for an OpenAI-compatible
+        server it is a request to LM Studio's REST API. Gemini has nothing to
+        free, and the button is not shown for it.
+        """
+        try:
+            settings = _read_config()
+            api_format = str(settings.get("api_format") or FORMAT_OPENAI).lower()
+            if api_format == FORMAT_GGUF:
+                # llm.close() blocks while the weights are freed, so it stays off
+                # the event loop like every other model-touching call here.
+                state = await asyncio.to_thread(_gguf_unload_now)
+                if state == "busy":
+                    return web.json_response(
+                        {"ok": False, "busy": True, "error": "A generation is still running"}, status=409,
+                    )
+                if state == "unloaded":
+                    _log("model unloaded")
+                return web.json_response({"ok": True, "unloaded": state == "unloaded"})
+            if api_format != FORMAT_OPENAI:
+                return web.json_response(
+                    {"ok": False, "error": "This backend has no model to unload"}, status=400,
+                )
+            if not str(settings.get("api_url") or "").strip():
+                return web.json_response({"ok": False, "error": "Set the API URL in the settings first"}, status=400)
+            count, detail = await asyncio.to_thread(_remote_unload, settings)
+            return web.json_response({"ok": True, "unloaded": count > 0, "detail": detail})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 

@@ -18,6 +18,7 @@ const SETTINGS_ENDPOINT = `${ROUTE_PREFIX}/settings`;
 const GGUF_ENDPOINT = `${ROUTE_PREFIX}/gguf_models`;
 const GENERATE_ENDPOINT = `${ROUTE_PREFIX}/generate`;
 const CANCEL_ENDPOINT = `${ROUTE_PREFIX}/generate_cancel`;
+const UNLOAD_ENDPOINT = `${ROUTE_PREFIX}/unload`;
 const ANSWER_EVENT = "llm_widget/answer";
 
 const FORMAT_OPENAI = "openai";
@@ -77,6 +78,10 @@ const TEXT = {
     stop: "Stop",
     copy: "Copy the answer",
     copied: "Answer copied",
+    unload: "Unload the model",
+    unloadHttp: "Unload the model (LM Studio / Ollama)",
+    unloaded: "Model unloaded",
+    unloadIdle: "No model was loaded",
     settings: "Settings",
     running: "Thinking",
     apiFormat: "API format",
@@ -798,6 +803,17 @@ function syncNode(node) {
     runButton.setAttribute("aria-label", runButton.title);
     runButton.classList.toggle("is-configured", isConfigured());
     runButton.classList.toggle("is-stop", pending);
+    const unloadButton = node.__llmwUnload;
+    if (unloadButton) {
+        // Gemini holds nothing. The local backend frees its own cache, and an
+        // OpenAI-compatible one is asked to — which only LM Studio answers, but
+        // that is the local server people actually run out of VRAM with.
+        const local = settingsCache.api_format === FORMAT_GGUF;
+        unloadButton.hidden = settingsCache.api_format === FORMAT_GEMINI;
+        unloadButton.disabled = pending;
+        unloadButton.title = local ? TEXT.unload : TEXT.unloadHttp;
+        unloadButton.setAttribute("aria-label", unloadButton.title);
+    }
     syncMediaLine(node);
 }
 
@@ -872,6 +888,7 @@ function installToolbar(node) {
         if (!answer) return;
         navigator.clipboard?.writeText?.(answer).then(() => notify(TEXT.copied, "success")).catch(() => {});
     });
+    const unloadButton = makeToolbarButton("is-unload", "⏏", TEXT.unload, () => unloadModel(node));
     const settingsButton = makeToolbarButton("is-settings", "⚙", TEXT.settings, () => openSettings());
     const media = document.createElement("div");
     media.className = "llmw-media";
@@ -879,7 +896,7 @@ function installToolbar(node) {
 
     // The status stretches so the buttons stay together in the bottom-right
     // corner of the node, with the run button in the corner itself.
-    bar.append(status, settingsButton, copyButton, runButton);
+    bar.append(status, settingsButton, copyButton, unloadButton, runButton);
     wrap.append(media, bar);
     // The canvas would otherwise zoom while the pointer sits over the toolbar.
     wrap.addEventListener("wheel", (event) => {
@@ -902,6 +919,7 @@ function installToolbar(node) {
     }
     widget.serialize = false;
     node.__llmwRun = runButton;
+    node.__llmwUnload = unloadButton;
     node.__llmwStatus = status;
     node.__llmwMedia = media;
     node.__llmwToolbar = widget;
@@ -967,6 +985,36 @@ async function generate(node) {
         node.__llmwAbort = null;
         setStatus(node, "idle");
         syncNode(node);
+    }
+}
+
+/**
+ * Free whatever model the configured backend is holding.
+ *
+ * A GGUF is cached across runs so a second question does not reload it, and with
+ * "Unload the model after answering" off nothing ever frees it. An
+ * OpenAI-compatible server is asked in whichever way it understands — the server
+ * works out whether it is talking to LM Studio or Ollama. Pointless against a
+ * cloud endpoint, but those are not the ones people run out of VRAM with. Either
+ * way this is the explicit way to hand the VRAM back before queueing the graph.
+ */
+async function unloadModel(node) {
+    const button = node?.__llmwUnload;
+    if (!button || button.disabled) return;
+    button.disabled = true;
+    try {
+        const response = await api.fetchApi(UNLOAD_ENDPOINT, { method: "POST" });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+        // `detail` carries the server's own wording, e.g. which models it does
+        // have resident when the configured one is not among them.
+        const message = data.unloaded ? TEXT.unloaded : String(data.detail || TEXT.unloadIdle);
+        notify(message, data.unloaded ? "success" : "info");
+    } catch (error) {
+        notify(error?.message || error);
+    } finally {
+        // syncNode owns the disabled state while a generation is pending.
+        button.disabled = Boolean(node.__llmwPending);
     }
 }
 
@@ -1044,6 +1092,9 @@ function installStyle() {
         transition: background .18s, border-color .18s, color .18s;
       }
       .llmw-tool:hover, .llmw-tool:focus-visible { border-color: rgba(168,199,250,.42); background: rgba(168,199,250,.14); color: #dce7fa; outline: none; }
+      .llmw-tool[hidden] { display: none !important; }
+      .llmw-tool:disabled { cursor: default; opacity: .4; }
+      .llmw-tool:disabled:hover { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.05); color: rgba(227,227,227,.62); }
       .llmw-tool.is-run { font-size: 15px; }
       .llmw-tool.is-run.is-configured { color: #a8c7fa; border-color: rgba(168,199,250,.3); }
       .llmw-tool.is-run.is-stop { color: #f28b82; border-color: rgba(242,139,130,.45); background: rgba(242,139,130,.12); font-size: 11px; }

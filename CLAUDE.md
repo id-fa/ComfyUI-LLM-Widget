@@ -64,12 +64,24 @@ answering about nothing. Do not "simplify" that by dropping the item.
 already-resolved `media_items`, so neither caller knows about the other's media source.
 
 - **openai / gemini** (`_http_generate`) — one `urllib` POST. URL handling is forgiving
-  (`_normalize_url` appends/strips endpoints, injects the Gemini model path).
+  (`_normalize_url` appends/strips endpoints, injects the Gemini model path). `_remote_unload`
+  is the one other thing spoken to an OpenAI-compatible server, and it is *not* an
+  OpenAI-compatible route: it is LM Studio's own REST API (`/api/v1/models/unload`) or Ollama's
+  `keep_alive: 0` on `/api/generate`, both rooted by `_server_root`, which is why the `/v1` has
+  to come off. Which server it is comes from the listing probes (`/api/v1/models` vs
+  `/api/ps`) — neither has the other's route, so the one that answers is the answer. That
+  detection is deliberate: **do not split `api_format` into per-vendor options.** They all
+  generate through the same endpoint, and one button is not worth tripling the settings, the
+  validation and the format rows in the dialog. If a server ever answers both probes, add an
+  override *inside* the openai format instead.
 - **gguf** (`_gguf_generate`) — `llama-cpp-python`. The loaded `Llama` is cached in `_GGUF_STATE`
-  keyed by `(model, mmproj, ctx, gpu_layers)` and released when that changes or on
-  `gguf_unload_after`. Vision needs an mmproj plus a chat handler class whose name varies per
-  llama-cpp build/fork, so `_gguf_chat_handler` probes candidates by model-name family and
-  degrades to text-only.
+  keyed by `(model, mmproj, ctx, gpu_layers)` and released when that changes, on
+  `gguf_unload_after`, on cancel, or from the toolbar's ⏏ (`POST /llm_widget/unload`). Vision
+  needs an mmproj plus a chat handler class whose name varies per llama-cpp build/fork, so
+  `_gguf_chat_handler` probes candidates by model-name family and degrades to text-only.
+  `_generate` holds `_gguf_hold` for the whole local run so the unload route can refuse while a
+  worker thread is generating — closing that `Llama` mid-generation takes llama-cpp down with it.
+  Every other `_gguf_release` call site already runs after the run unwound.
 - llama-cpp takes the same OpenAI-shaped `image_url` parts, so the media builders are shared and
   the GGUF path passes `FORMAT_OPENAI` as its `parts_format`.
 
@@ -96,7 +108,7 @@ from that handler, because the worker thread outlives it and does that itself.
 ## Reasoning
 
 The `thinking` setting is `off` (default) or `keep`; `off` means *both* "send the switches" and
-"strip what comes back". Two mistakes were made here already — do not reintroduce either:
+"strip what comes back". Three mistakes were made here already — do not reintroduce any of them:
 
 1. **`_http_generate` originally sent nothing at all.** Only the GGUF path had `/no_think`, so any
    OpenAI-compatible server reasoned freely into the answer. The switches now go through
@@ -107,6 +119,13 @@ The `thinking` setting is `off` (default) or `keep`; `off` means *both* "send th
    in the assistant turn, so the response begins with bare reasoning prose and the only tag in it
    is the closing one — the whole block leaked. `_THINK_CLOSE_RE` therefore makes the opening tag
    optional and is greedy to the **last** closing tag.
+3. **Only Harmony's exact `<|channel|>final<|message|>` was recognised.** Gemma 4 marks its
+   reasoning with the same idea but different pipes — `<|channel>thought` … `<channel|>`, the
+   closing marker carrying no role and no `<|message|>` — so the whole thought leaked.
+   `_CHANNEL_MARK` therefore accepts every spelling, and `_THOUGHT_CHANNEL_RE` cuts to the last
+   marker when the block opens on a thinking role. Note that `<|channel>` is *also* in the gemma
+   `stop` list in `_gguf_chat`; it evidently does not fire through the vision chat handler, but
+   do not add the closing marker there — the answer is what follows it.
 
 Untagged reasoning cannot be removed: nothing marks where it ends. Do not add heuristics that
 guess at prose preambles — they will eat real answers. The switches are what has to work; the
