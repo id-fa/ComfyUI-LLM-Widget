@@ -7,4 +7,4 @@ Thumbs.db
 .vscode/
 *.log
 llm_widget.json
-tools/
+.claude.log/
