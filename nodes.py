@@ -92,6 +92,14 @@ MEDIA_MAX_BYTES = 32 * 1024 * 1024
 CANCEL_LIMIT = 64
 
 DESCRIBE_LENGTH = 256
+# Gemma has no switch for its reasoning — no `/no_think`, and its chat handler
+# rejects `force_reasoning` — so the thought is generated whether it is wanted or
+# not, out of the same budget as the description. 256 tokens is enough for one or
+# the other, and a run that stops mid-thought yields *nothing*: the block never
+# closes, so `_clean_output` has no answer to separate out. The headroom is spent
+# on text that is then thrown away, which is why only the models that cannot be
+# told to skip it get it.
+DESCRIBE_THINKING_HEADROOM = 768
 DESCRIBE_SYSTEM = (
     "You describe one piece of media so another model can reason about it from your words alone.\n"
     "Report only what is actually present: subject, appearance, clothing, pose, setting, lighting, "
@@ -126,6 +134,7 @@ CONFIG_DEFAULTS = {
     "max_length": MAX_LENGTH_DEFAULT,
     "continue_chat": False,
     "history_turns": HISTORY_TURNS_DEFAULT,
+    "chat_blank_lines": True,
     "gguf_model": "",
     "gguf_mmproj": GGUF_MMPROJ_AUTO,
     "gguf_context": GGUF_CONTEXT,
@@ -196,6 +205,7 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
         "max_length": integer("max_length", MAX_LENGTH_DEFAULT, MAX_LENGTH_MIN, MAX_LENGTH_LIMIT),
         "continue_chat": _as_bool(source.get("continue_chat"), False),
         "history_turns": integer("history_turns", HISTORY_TURNS_DEFAULT, HISTORY_TURNS_MIN, HISTORY_TURNS_LIMIT),
+        "chat_blank_lines": _as_bool(source.get("chat_blank_lines"), True),
         "gguf_model": str(source.get("gguf_model") or "").strip(),
         "gguf_mmproj": mmproj,
         "gguf_context": integer("gguf_context", GGUF_CONTEXT, GGUF_CONTEXT_MIN, GGUF_CONTEXT_LIMIT),
@@ -423,6 +433,17 @@ _WHOLE_FENCE_RE = re.compile(r"\A```([A-Za-z0-9_+.-]*)[ \t]*\r?\n(.*?)\r?\n?```\
 _PLAIN_FENCE_LANGS = {"", "text", "txt", "plain", "plaintext", "prompt", "output"}
 
 
+def _opens_with_thinking(text: Any) -> bool:
+    """Whether the text begins inside a reasoning block.
+
+    On a value `_clean_output` has already worked through, this means the block
+    was never closed: the model was still thinking when it ran out of tokens, so
+    there is no answer anywhere in it.
+    """
+    value = str(text or "").strip()
+    return bool(_OPEN_THINK_RE.match(value) or _OPEN_CHANNEL_RE.match(value))
+
+
 def _clean_output(text: Any, strip_thinking: bool = True) -> str:
     """Reduce a model's answer to the answer itself.
 
@@ -440,7 +461,7 @@ def _clean_output(text: Any, strip_thinking: bool = True) -> str:
         value = _THOUGHT_CHANNEL_RE.sub("", value).strip()
         value = _TRAILING_TOKEN_RE.sub("", value).strip()
         value = _THINK_CLOSE_RE.sub("", value).strip()
-        if _OPEN_THINK_RE.match(value) or _OPEN_CHANNEL_RE.match(value):
+        if _opens_with_thinking(value):
             # An unterminated block means the answer was cut off mid-thought,
             # so there is no answer in here at all.
             return ""
@@ -514,14 +535,20 @@ def _last_answer(transcript: Any) -> str:
     return "" if turns else value.strip()
 
 
-def _append_turn(transcript: Any, question: str, answer: str) -> str:
-    """Add one exchange to the log, keeping what is already in the widget."""
+def _append_turn(transcript: Any, question: str, answer: str, blank_lines: bool = True) -> str:
+    """Add one exchange to the log, keeping what is already in the widget.
+
+    Whether the blocks are separated by a blank line is a matter of taste — one
+    reads like a chat, the other like an actual IRC log — and the parser does
+    not care either way, since a turn ends where the next marker begins.
+    """
+    separator = "\n\n" if blank_lines else "\n"
     block = (
-        f"{CHAT_USER_MARK} {str(question).strip()}\n\n"
+        f"{CHAT_USER_MARK} {str(question).strip()}{separator}"
         f"{CHAT_MODEL_MARK} {str(answer).strip()}"
     )
     base = str(transcript or "").rstrip()
-    return f"{base}\n\n{block}" if base else block
+    return f"{base}{separator}{block}" if base else block
 
 
 # --------------------------------------------------------------------------- #
@@ -1390,14 +1417,27 @@ def _gguf_chat(
         # template, and ignores it otherwise, so sending both is the only way to
         # cover the whole family.
         request["chat_template_kwargs"] = {"enable_thinking": False}
+
+    def finish(raw: Any) -> str:
+        text = _clean_output(raw, no_think)
+        if not text and no_think and _opens_with_thinking(raw):
+            # Distinguishable from "the model said nothing": the block is there,
+            # it simply never closed. Naming it is the difference between a
+            # setting the user can raise and an unexplained empty answer.
+            raise ValueError(
+                f"The model spent all {int(max_tokens)} tokens reasoning and never reached an answer. "
+                "Raise Max answer tokens, or use a model whose thinking can be switched off."
+            )
+        return text
+
     if should_stop is not None:
-        return _clean_output(_gguf_stream(llm, request, should_stop), no_think)
+        return finish(_gguf_stream(llm, request, should_stop))
     step = time.perf_counter()
     result = _gguf_call(llm, request)
     _log("generation finished in %.1fs", time.perf_counter() - step)
     choices = result.get("choices") if isinstance(result, Mapping) else None
     message = (choices or [{}])[0].get("message") if choices else None
-    return _clean_output((message or {}).get("content"), no_think)
+    return finish((message or {}).get("content"))
 
 
 def _gguf_describe(
@@ -1420,9 +1460,16 @@ def _gguf_describe(
         return "", 0
     gemma = _is_gemma_name(str(settings.get("gguf_model") or ""))
     length = min(int(settings.get("max_length") or MAX_LENGTH_DEFAULT), DESCRIBE_LENGTH)
+    if gemma:
+        # `max_length` caps the *answer*, and this pass is not the answer: what
+        # the extra buys is room for a thought that is discarded either way.
+        # Without it Gemma stops mid-thought and every description comes back
+        # empty, which used to leave the final pass answering about no media
+        # at all.
+        length += DESCRIBE_THINKING_HEADROOM
     temperature = float(settings.get("temperature", CONFIG_DEFAULTS["temperature"]))
     started = time.perf_counter()
-    _log("describing %d connected media with the GGUF, one at a time", len(describable))
+    _log("describing %d connected media with the GGUF, one at a time (max_tokens=%d)", len(describable), length)
     lines: list[str] = []
     try:
         for index, item in enumerate(describable, start=1):
@@ -1550,6 +1597,17 @@ def _generate(
         described, described_count = "", 0
         if describe:
             described, described_count = _gguf_describe(settings, media_items, should_stop)
+            if not described_count and any(item.get("parts") for item in media_items):
+                # Every description failed. Carrying on would ask the question
+                # with no media and no media rule, and the model would answer
+                # about nothing at all — the one outcome this pack does not
+                # allow. Fall back to the single-prompt path instead, which is
+                # slower to start but at least sees the images.
+                logging.warning(
+                    LOG_PREFIX + "the describe pass produced no descriptions; "
+                    "attaching the media to the question instead."
+                )
+                describe = False
         attached = [] if describe else [item for item in media_items if item.get("parts")]
         media_parts = [part for item in attached for part in item["parts"]]
         system = _system_prompt(system_prompt, attached, described_count)
@@ -1719,7 +1777,10 @@ def _register_routes() -> bool:
             skipped = [item["tag"] for item in items if not item.get("parts")]
             # The log is formatted here rather than in the editor so the markers
             # the parser reads and the ones written are the same two constants.
-            updated = _append_turn(transcript, question, answer) if _as_bool(settings.get("continue_chat")) else ""
+            updated = (
+                _append_turn(transcript, question, answer, _as_bool(settings.get("chat_blank_lines"), True))
+                if _as_bool(settings.get("continue_chat")) else ""
+            )
             return web.json_response(
                 {"ok": True, "answer": answer, "transcript": updated, "skipped": skipped},
             )
@@ -1858,7 +1919,8 @@ class LLMWidget:
         # mode — while the output socket carries the reply on its own.
         _notify_answer(
             unique_id,
-            _append_turn(stored, str(question), text) if _as_bool(settings.get("continue_chat")) else text,
+            _append_turn(stored, str(question), text, _as_bool(settings.get("chat_blank_lines"), True))
+            if _as_bool(settings.get("continue_chat")) else text,
         )
         return (text,)
 

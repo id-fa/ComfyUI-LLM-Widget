@@ -75,6 +75,7 @@ const SETTINGS_DEFAULTS = Object.freeze({
     max_length: MAX_LENGTH_DEFAULT,
     continue_chat: false,
     history_turns: HISTORY_TURNS_DEFAULT,
+    chat_blank_lines: true,
     gguf_model: "",
     gguf_mmproj: GGUF_MMPROJ_AUTO,
     gguf_context: GGUF_CONTEXT_DEFAULT,
@@ -113,6 +114,7 @@ const TEXT = {
     readMedia: "Send the connected image / video",
     continueChat: "Continue the conversation",
     historyTurns: "Exchanges kept in the history",
+    chatBlankLines: "Blank line between the log entries",
     continueHint:
         "Every turn is appended to the answer field as an IRC-style log, and the exchanges above the "
         + "question are sent with it. The field stays a plain text box: edit or delete lines to change "
@@ -182,6 +184,7 @@ function normalizeSettings(value) {
         max_length: clampNumber(source.max_length, MAX_LENGTH_DEFAULT, MAX_LENGTH_MIN, MAX_LENGTH_LIMIT),
         continue_chat: asBoolean(source.continue_chat, false),
         history_turns: clampNumber(source.history_turns, HISTORY_TURNS_DEFAULT, HISTORY_TURNS_MIN, HISTORY_TURNS_LIMIT),
+        chat_blank_lines: asBoolean(source.chat_blank_lines, true),
         gguf_model: String(source.gguf_model || "").trim(),
         gguf_mmproj: String(source.gguf_mmproj || GGUF_MMPROJ_AUTO).trim() || GGUF_MMPROJ_AUTO,
         gguf_context: clampNumber(source.gguf_context, GGUF_CONTEXT_DEFAULT, GGUF_CONTEXT_MIN, GGUF_CONTEXT_LIMIT),
@@ -649,6 +652,7 @@ async function openSettings() {
     const ggufMmproj = makeSelect(settingsCache.gguf_mmproj, null, mmprojOptions(settingsCache.gguf_mmproj));
     const readMedia = makeSwitch(settingsCache.read_media, () => syncFormatRows());
     const continueChat = makeSwitch(settingsCache.continue_chat, () => syncFormatRows());
+    const chatBlankLines = makeSwitch(settingsCache.chat_blank_lines);
     const ggufUnload = makeSwitch(settingsCache.gguf_unload_after);
     const ggufDescribe = makeSwitch(settingsCache.gguf_describe_media);
 
@@ -670,6 +674,7 @@ async function openSettings() {
     const readMediaRow = makeCheckRow(TEXT.readMedia, readMedia);
     const continueChatRow = makeCheckRow(TEXT.continueChat, continueChat);
     const historyTurnsRow = makeRow(TEXT.historyTurns, historyTurns);
+    const chatBlankLinesRow = makeCheckRow(TEXT.chatBlankLines, chatBlankLines);
     const continueHint = document.createElement("p");
     continueHint.className = "llmw-hint";
     continueHint.textContent = TEXT.continueHint;
@@ -692,6 +697,7 @@ async function openSettings() {
         maxLengthRow,
         continueChatRow,
         historyTurnsRow,
+        chatBlankLinesRow,
         continueHint,
         ggufUnloadRow,
         readMediaRow,
@@ -734,8 +740,10 @@ async function openSettings() {
         for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadRow]) row.hidden = !gguf;
         // Describing media one at a time only means something once media is sent.
         ggufDescribeRow.hidden = !gguf || !readMedia.checked;
-        // How much history to replay is only a question once there is any.
+        // How much history to replay, and how the log is spaced, are only
+        // questions once there is a log at all.
         historyTurnsRow.hidden = !continueChat.checked;
+        chatBlankLinesRow.hidden = !continueChat.checked;
         hint.textContent = gguf ? TEXT.ggufHint : gemini ? TEXT.geminiHint : TEXT.httpHint;
         apiUrl.placeholder = gemini ? "https://generativelanguage.googleapis.com" : "http://127.0.0.1:1234/v1";
         if (gguf) refreshGgufOptions();
@@ -769,6 +777,7 @@ async function openSettings() {
         max_length: maxLength.value,
         continue_chat: continueChat.checked,
         history_turns: historyTurns.value,
+        chat_blank_lines: chatBlankLines.checked,
         gguf_model: ggufModel.value,
         gguf_mmproj: ggufMmproj.value,
         gguf_context: ggufContext.value,

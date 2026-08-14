@@ -92,6 +92,19 @@ the editor appears to freeze. Because that pass loads the projector, the final t
 `keep_vision=True`; without it the signature would change and the model would be reloaded between
 the two.
 
+Two things that mode gets wrong if you are not careful, both found with Gemma 4:
+
+- **The describe pass has its own token budget, and a model that cannot be told to stop reasoning
+  spends it on the thought.** `DESCRIBE_LENGTH` alone left Gemma stopping mid-thought, so
+  `_clean_output` correctly returned nothing at all and *every* description came back empty.
+  `DESCRIBE_THINKING_HEADROOM` is added for the families with no working switch (gemma), and is
+  deliberately not tied to `max_length`: it buys room for text that is discarded either way.
+- **A describe pass that produced nothing must not be treated as "no media was connected".**
+  `_generate` falls back to the single-prompt path (`describe = False`) and logs it. Without that
+  the final pass got no parts *and* no media rule, and the model answered — reasonably — that
+  there was nothing to look at. Same principle as the empty-`parts` item in `_media_items`: never
+  answer about media as if it had not been there.
+
 ## Continue mode
 
 `continue_chat` makes the run replay the earlier turns. There is **no separate history store**:
@@ -108,6 +121,9 @@ workflow like any other widget value. Do not move it into a hidden serialized wi
 - `_append_turn` and `_last_answer` live in Python and are the only writers/readers of the
   format; the route returns `transcript` (the whole log) *and* `answer` (this reply). The JS
   copy of the rule is `lastAnswer`, used only for the ⧉ button.
+- `chat_blank_lines` only changes what `_append_turn` writes between blocks. A turn ends where
+  the next marker begins, so both spacings parse the same and a log written under one setting
+  keeps working under the other — do not make the parser depend on it.
 - Earlier turns are **text only** on every backend. Re-encoding an image on every following turn
   costs more than it is worth and its file may be gone; media attaches to the current question.
 - The node's `text` output is always `_last_answer`, never the log — this is why the widget can
@@ -153,6 +169,11 @@ The `thinking` setting is `off` (default) or `keep`; `off` means *both* "send th
 Untagged reasoning cannot be removed: nothing marks where it ends. Do not add heuristics that
 guess at prose preambles — they will eat real answers. The switches are what has to work; the
 honest fallback is telling the user to pick a non-thinking model.
+
+A block that never closes means the model ran out of tokens while thinking, and `_clean_output`
+returns "" because there genuinely is no answer in it. `_gguf_chat` turns that specific case into
+an error that says so (`_opens_with_thinking`) instead of an unexplained empty answer: the user
+can act on "raise Max answer tokens", not on "empty".
 
 `_clean_output` unwraps a whole-answer code fence **only** for languages in `_PLAIN_FENCE_LANGS`.
 A ` ```python ` block is the answer itself; stripping it would corrupt a legitimate request for

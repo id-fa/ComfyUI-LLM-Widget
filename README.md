@@ -149,6 +149,7 @@ Reroute ノードは辿って追跡します。
 | Max answer tokens | 全て | ローカルバックエンドでは `max_tokens`。答えの長さの上限 |
 | Continue the conversation | 全て | 前回までのやり取りも一緒に送ります — *会話を続ける* を参照 |
 | Exchanges kept in the history | 全て | 送るやり取りの上限（新しい方から数えて何往復ぶんか） |
+| Blank line between the log entries | 全て | ログの各ブロックの間に空行を入れるか。オフで詰めた IRC ログになります |
 | Unload after answering | gguf | モデルを常駐させず、すぐに VRAM を解放。オフのままでもツールバーの ⏏ でいつでも解放できます |
 | Send the connected image / video | 全て | オフにすると質問は純粋なテキストとして送られます |
 | Describe each media in its own pass | gguf | 下記参照 |
@@ -168,6 +169,18 @@ Reroute ノードは辿って追跡します。
 
 <llm> a photograph of a tabby cat sitting on a windowsill at golden hour, ...
 ```
+
+`Blank line between the log entries` をオフにすると空行なしで詰まります。
+
+```
+<you> 猫の写真のプロンプトを書いて
+<llm> a photograph of a tabby cat sitting on a windowsill, ...
+<you> もう少し夕方っぽく
+<llm> a photograph of a tabby cat ... at golden hour, ...
+```
+
+どちらの書き方も同じように読み取れます。ターンの終わりは次のマーカーが始まる位置なので、途中で
+設定を切り替えても、それ以前のログはそのまま会話として扱われます。
 
 会話の実体はこのテキストだけです。どこにも別の履歴は持っていません。つまり **行を書き換えれば
 モデルの記憶が変わり、消せば忘れます**。ウィジェットは普通のテキストボックスのままなので、
@@ -193,6 +206,14 @@ IME も、リサイズも、undo も今までどおり効きます。ワーク�
 プロンプト評価フェーズは中断できないからです。大きなマルチモーダルプロンプトを 1 回投げることが、
 エディタがしばらく固まったように見える原因です。この方式なら、メディアとメディアの間で
 キャンセルが効く余地も生まれます。
+
+説明パスにはこのモード専用のトークン上限があります。Gemma のように **推論を止める手段が無い**
+モデルは、その枠を思考で使い切ってしまい、思考の途中で打ち切られた出力には答えが 1 文字も
+含まれません（閉じマーカーが来ないため）。そこで Gemma 系にだけ思考ぶんの余白を上乗せしています
+（`max_length` とは別枠です。どうせ捨てるテキストのための余白なので）。
+
+それでも全部の説明が失敗した場合は、**メディアが繋がっていなかったことにはしません**。ログに警告を
+出したうえで、通常どおり画像を質問に添付する経路に切り替えます。
 
 ### 停止
 
@@ -422,6 +443,7 @@ API key** and is gitignored.
 | Max answer tokens | all | `max_tokens` for the local backends, the answer length cap |
 | Continue the conversation | all | Send the earlier turns along with the question — see *Continuing the conversation* |
 | Exchanges kept in the history | all | How many of the most recent exchanges are replayed |
+| Blank line between the log entries | all | Whether the log's blocks are separated by a blank line. Off gives a tight IRC log |
 | Unload after answering | gguf | Frees VRAM immediately instead of keeping the model resident. Leave it off and use the toolbar's ⏏ when you want the VRAM back |
 | Send the connected image / video | all | Off means the question is asked as pure text |
 | Describe each media in its own pass | gguf | See below |
@@ -440,6 +462,18 @@ appends two blocks to it, and the exchanges above the question are sent with the
 
 <llm> a photograph of a tabby cat sitting on a windowsill at golden hour, ...
 ```
+
+Turn `Blank line between the log entries` off and the blocks are written tight:
+
+```
+<you> Write a prompt for a photo of a cat
+<llm> a photograph of a tabby cat sitting on a windowsill, ...
+<you> More like early evening
+<llm> a photograph of a tabby cat ... at golden hour, ...
+```
+
+Both spellings read back the same — a turn ends where the next marker begins — so switching the
+setting mid-conversation leaves the earlier log perfectly readable.
 
 That text is the entire conversation — there is no history stored anywhere else. **Edit a line
 and you change what the model remembers; delete one and it forgets.** The widget is still an
@@ -467,6 +501,16 @@ It is slower in total but each individual step is small, which matters because l
 prompt-evaluation phase cannot be interrupted — a single large multimodal prompt is the
 reason the editor can appear frozen for a while. It also gives cancellation a chance to
 land between assets.
+
+The describe pass has a token budget of its own. A model whose reasoning **cannot be switched
+off** — Gemma has no `/no_think` and its chat handler rejects the flag — spends that budget on
+the thought, and an output cut off mid-thought contains no answer at all, since the closing
+marker never arrives. Gemma-family models therefore get extra headroom on top (separate from
+`max_length`, because it pays for text that is discarded anyway).
+
+If every description fails regardless, the run does **not** pretend no media was connected: it
+logs a warning and falls back to attaching the images to the question, the way the mode does
+when it is off.
 
 ### Stopping
 
