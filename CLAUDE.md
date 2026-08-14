@@ -92,6 +92,29 @@ the editor appears to freeze. Because that pass loads the projector, the final t
 `keep_vision=True`; without it the signature would change and the model would be reloaded between
 the two.
 
+## Continue mode
+
+`continue_chat` makes the run replay the earlier turns. There is **no separate history store**:
+the `answer` widget *is* the conversation, written as an IRC-style log with the line-start
+markers `CHAT_USER_MARK` / `CHAT_MODEL_MARK`. That is the whole point — the log is a plain
+textarea, so editing or deleting lines edits what the model remembers, and it is saved with the
+workflow like any other widget value. Do not move it into a hidden serialized widget.
+
+- `_parse_transcript` → `_history_messages` (merges consecutive same-role turns, keeps the last
+  `history_turns` exchanges, drops a leading assistant turn) → the backends' `messages` /
+  `contents`. Gemini rejects two user turns in a row, which is why the merge is not optional.
+- Text before the first marker is **not** part of the conversation. It is whatever the widget
+  held when the mode was switched on, and it is left alone rather than deleted.
+- `_append_turn` and `_last_answer` live in Python and are the only writers/readers of the
+  format; the route returns `transcript` (the whole log) *and* `answer` (this reply). The JS
+  copy of the rule is `lastAnswer`, used only for the ⧉ button.
+- Earlier turns are **text only** on every backend. Re-encoding an image on every following turn
+  costs more than it is worth and its file may be gone; media attaches to the current question.
+- The node's `text` output is always `_last_answer`, never the log — this is why the widget can
+  hold a whole conversation without breaking anything wired downstream.
+- The editor clears the `question` widget after a successful continue-mode turn, because the
+  question is in the log by then.
+
 ## Cancellation
 
 `✦` becomes `■` while pending, aborting the fetch and calling `POST /llm_widget/generate_cancel`
@@ -137,12 +160,23 @@ code. This is a deliberate divergence from the MiniMax H3 optimizer, which alway
 
 ## Text fields stay native
 
-`system_prompt`, `question` and `answer` are ordinary ComfyUI multiline `STRING` widgets. They are
+`system_prompt`, `answer` and `question` are ordinary ComfyUI multiline `STRING` widgets. They are
 **not** replaced by DOM widgets: the native textarea already handles IME composition (this pack's
 author writes Japanese), resizing and undo. The only DOM widget is the toolbar, which is added last
-and stays last, under the answer field, so the run and copy buttons sit in the node's bottom-right
-corner where the eye ends up after reading the answer. Inside the row the status label stretches and
-the buttons are right-aligned; the media chips sit above the button row.
+and stays last, so the run and copy buttons sit in the node's bottom-right corner where the eye
+already is after typing. Inside the row the status label stretches and the buttons are
+right-aligned, with an empty button's width (`.llmw-gap`) held open in front of ✦ so a misaimed
+click lands on nothing instead of ⏏; the media chips sit above the button row.
+
+**The order of the `INPUT_TYPES` dict *is* the layout**, and it is
+`system_prompt → generate_on_execute → answer → question`. The question box therefore sits at the
+bottom with the toolbar under it: a chat input below its own transcript, with ✦ where a send button
+belongs. `generate_on_execute` is a setting rather than part of that flow, which is why it is above
+them instead of between the question and the button. Do not make the order depend on
+`continue_chat`, however tempting: `widgets_values` is
+serialized by index, so a workflow saved under one setting would load with `question` and `answer`
+swapped under the other — and the setting is installation-global. Reordering `node.widgets` from
+the frontend has the same defect plus a frontend-version one.
 
 `setWidgetText` writes `widget.value`, `widget.element.value` and `widget.inputEl.value` and calls
 the callback, because which of those a multiline widget actually reads differs across ComfyUI
@@ -152,8 +186,8 @@ frontend versions.
 
 Constants duplicated between `nodes.py` and `web/llm_widget_ui.js` must be edited in both: the
 route paths under `/llm_widget/`, `ANSWER_EVENT`, the three format ids, `GGUF_MMPROJ_AUTO` /
-`GGUF_MMPROJ_NONE`, and every settings key with its clamp range (both sides normalize
-independently, and the server's normalization is authoritative).
+`GGUF_MMPROJ_NONE`, `CHAT_USER_MARK` / `CHAT_MODEL_MARK`, and every settings key with its clamp
+range (both sides normalize independently, and the server's normalization is authoritative).
 
 ## Conventions
 

@@ -39,6 +39,15 @@ const THINKING_LABELS = {
     [THINKING_KEEP]: "Keep — show the reasoning in the answer",
 };
 
+// Continue mode turns the answer field into an IRC-style log. The markers are
+// the server's, and only a line that starts with one opens a turn.
+const CHAT_USER_MARK = "<you>";
+const CHAT_MODEL_MARK = "<llm>";
+const CHAT_TURN_RE = new RegExp(`^(${CHAT_USER_MARK}|${CHAT_MODEL_MARK})[ \\t]*`, "gm");
+const HISTORY_TURNS_DEFAULT = 8;
+const HISTORY_TURNS_MIN = 1;
+const HISTORY_TURNS_LIMIT = 64;
+
 const MAX_LENGTH_DEFAULT = 1024;
 const MAX_LENGTH_MIN = 16;
 const MAX_LENGTH_LIMIT = 32768;
@@ -64,6 +73,8 @@ const SETTINGS_DEFAULTS = Object.freeze({
     thinking: THINKING_OFF,
     temperature: 0.35,
     max_length: MAX_LENGTH_DEFAULT,
+    continue_chat: false,
+    history_turns: HISTORY_TURNS_DEFAULT,
     gguf_model: "",
     gguf_mmproj: GGUF_MMPROJ_AUTO,
     gguf_context: GGUF_CONTEXT_DEFAULT,
@@ -78,6 +89,9 @@ const TEXT = {
     stop: "Stop",
     copy: "Copy the answer",
     copied: "Answer copied",
+    clear: "Clear the conversation",
+    clearConfirm: "Clear the conversation log in the answer field?",
+    cleared: "Conversation cleared",
     unload: "Unload the model",
     unloadHttp: "Unload the model (LM Studio / Ollama)",
     unloaded: "Model unloaded",
@@ -97,6 +111,13 @@ const TEXT = {
     ggufUnload: "Unload the model after answering",
     ggufDescribe: "Describe each media in its own pass",
     readMedia: "Send the connected image / video",
+    continueChat: "Continue the conversation",
+    historyTurns: "Exchanges kept in the history",
+    continueHint:
+        "Every turn is appended to the answer field as an IRC-style log, and the exchanges above the "
+        + "question are sent with it. The field stays a plain text box: edit or delete lines to change "
+        + "what the model remembers. Connected media is attached to the current question only, and the "
+        + "node's text output carries the last <llm> block alone.",
     thinking: "Model thinking",
     thinkingHint:
         "Off sends the switches each backend understands and removes any <think> block the model "
@@ -159,6 +180,8 @@ function normalizeSettings(value) {
             : THINKING_OFF,
         temperature: clampNumber(source.temperature, SETTINGS_DEFAULTS.temperature, 0, 2, false),
         max_length: clampNumber(source.max_length, MAX_LENGTH_DEFAULT, MAX_LENGTH_MIN, MAX_LENGTH_LIMIT),
+        continue_chat: asBoolean(source.continue_chat, false),
+        history_turns: clampNumber(source.history_turns, HISTORY_TURNS_DEFAULT, HISTORY_TURNS_MIN, HISTORY_TURNS_LIMIT),
         gguf_model: String(source.gguf_model || "").trim(),
         gguf_mmproj: String(source.gguf_mmproj || GGUF_MMPROJ_AUTO).trim() || GGUF_MMPROJ_AUTO,
         gguf_context: clampNumber(source.gguf_context, GGUF_CONTEXT_DEFAULT, GGUF_CONTEXT_MIN, GGUF_CONTEXT_LIMIT),
@@ -257,6 +280,34 @@ function setWidgetText(node, name, value) {
     }
     node.setDirtyCanvas?.(true, true);
     app.graph?.change?.();
+}
+
+/** The textarea behind a multiline widget, wherever this frontend keeps it. */
+function widgetField(node, name) {
+    const widget = getWidget(node, name);
+    const host = widget?.inputEl || widget?.element;
+    if (!host) return null;
+    return host.tagName === "TEXTAREA" ? host : host.querySelector?.("textarea") || null;
+}
+
+/**
+ * The reply inside the answer field: its last `<llm>` block.
+ *
+ * The server owns the same rule for what it sends the node's text output; this
+ * copy is only so the copy button hands over the answer rather than the whole
+ * conversation. A field with no markers is a plain answer and comes back whole.
+ */
+function lastAnswer(text) {
+    const value = String(text ?? "");
+    const marks = [...value.matchAll(CHAT_TURN_RE)];
+    if (!marks.length) return value.trim();
+    for (let index = marks.length - 1; index >= 0; index -= 1) {
+        if (marks[index][1] !== CHAT_MODEL_MARK) continue;
+        const end = index + 1 < marks.length ? marks[index + 1].index : value.length;
+        const content = value.slice(marks[index].index + marks[index][0].length, end).trim();
+        if (content) return content;
+    }
+    return "";
 }
 
 /** Resolve one of this node's inputs to the graph node that actually feeds it. */
@@ -585,6 +636,7 @@ async function openSettings() {
     );
     const temperature = makeNumberInput(settingsCache.temperature, 0, 2, 0.05);
     const maxLength = makeNumberInput(settingsCache.max_length, MAX_LENGTH_MIN, MAX_LENGTH_LIMIT, 16);
+    const historyTurns = makeNumberInput(settingsCache.history_turns, HISTORY_TURNS_MIN, HISTORY_TURNS_LIMIT, 1);
     const ggufContext = makeNumberInput(settingsCache.gguf_context, GGUF_CONTEXT_MIN, GGUF_CONTEXT_LIMIT, 512);
     const ggufGpuLayers = makeNumberInput(settingsCache.gguf_gpu_layers, -1, 1024, 1);
     const ggufModel = makeSelect(settingsCache.gguf_model, null, [
@@ -596,6 +648,7 @@ async function openSettings() {
     // and the catalog fetch below then "restored" that reset value.
     const ggufMmproj = makeSelect(settingsCache.gguf_mmproj, null, mmprojOptions(settingsCache.gguf_mmproj));
     const readMedia = makeSwitch(settingsCache.read_media, () => syncFormatRows());
+    const continueChat = makeSwitch(settingsCache.continue_chat, () => syncFormatRows());
     const ggufUnload = makeSwitch(settingsCache.gguf_unload_after);
     const ggufDescribe = makeSwitch(settingsCache.gguf_describe_media);
 
@@ -615,6 +668,11 @@ async function openSettings() {
     const ggufContextRow = makeRow(TEXT.ggufContext, ggufContext);
     const ggufGpuLayersRow = makeRow(TEXT.ggufGpuLayers, ggufGpuLayers);
     const readMediaRow = makeCheckRow(TEXT.readMedia, readMedia);
+    const continueChatRow = makeCheckRow(TEXT.continueChat, continueChat);
+    const historyTurnsRow = makeRow(TEXT.historyTurns, historyTurns);
+    const continueHint = document.createElement("p");
+    continueHint.className = "llmw-hint";
+    continueHint.textContent = TEXT.continueHint;
     const ggufUnloadRow = makeCheckRow(TEXT.ggufUnload, ggufUnload);
     const ggufDescribeRow = makeCheckRow(TEXT.ggufDescribe, ggufDescribe);
 
@@ -632,6 +690,9 @@ async function openSettings() {
         thinkingHint,
         temperatureRow,
         maxLengthRow,
+        continueChatRow,
+        historyTurnsRow,
+        continueHint,
         ggufUnloadRow,
         readMediaRow,
         ggufDescribeRow,
@@ -673,6 +734,8 @@ async function openSettings() {
         for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadRow]) row.hidden = !gguf;
         // Describing media one at a time only means something once media is sent.
         ggufDescribeRow.hidden = !gguf || !readMedia.checked;
+        // How much history to replay is only a question once there is any.
+        historyTurnsRow.hidden = !continueChat.checked;
         hint.textContent = gguf ? TEXT.ggufHint : gemini ? TEXT.geminiHint : TEXT.httpHint;
         apiUrl.placeholder = gemini ? "https://generativelanguage.googleapis.com" : "http://127.0.0.1:1234/v1";
         if (gguf) refreshGgufOptions();
@@ -704,6 +767,8 @@ async function openSettings() {
         thinking: thinking.value,
         temperature: temperature.value,
         max_length: maxLength.value,
+        continue_chat: continueChat.checked,
+        history_turns: historyTurns.value,
         gguf_model: ggufModel.value,
         gguf_mmproj: ggufMmproj.value,
         gguf_context: ggufContext.value,
@@ -803,6 +868,16 @@ function syncNode(node) {
     runButton.setAttribute("aria-label", runButton.title);
     runButton.classList.toggle("is-configured", isConfigured());
     runButton.classList.toggle("is-stop", pending);
+    const clearButton = node.__llmwClear;
+    if (clearButton) {
+        // Nothing to clear outside continue mode: the answer field then holds a
+        // single answer that the next run overwrites anyway.
+        clearButton.hidden = !settingsCache.continue_chat;
+        clearButton.disabled = pending;
+    }
+    // A log reads as a log in a monospaced face, and the field is still the
+    // native textarea underneath — only its font is ours.
+    widgetField(node, "answer")?.classList?.toggle("llmw-log", settingsCache.continue_chat);
     const unloadButton = node.__llmwUnload;
     if (unloadButton) {
         // Gemini holds nothing. The local backend frees its own cache, and an
@@ -884,19 +959,27 @@ function installToolbar(node) {
     const status = document.createElement("span");
     status.className = "llmw-status";
     const copyButton = makeToolbarButton("is-copy", "⧉", TEXT.copy, () => {
-        const answer = widgetText(node, "answer");
+        // The reply, not the log around it — the whole conversation is one
+        // select-all away in the text box itself.
+        const answer = lastAnswer(widgetText(node, "answer"));
         if (!answer) return;
         navigator.clipboard?.writeText?.(answer).then(() => notify(TEXT.copied, "success")).catch(() => {});
     });
+    const clearButton = makeToolbarButton("is-clear", "⌫", TEXT.clear, () => clearConversation(node));
     const unloadButton = makeToolbarButton("is-unload", "⏏", TEXT.unload, () => unloadModel(node));
     const settingsButton = makeToolbarButton("is-settings", "⚙", TEXT.settings, () => openSettings());
     const media = document.createElement("div");
     media.className = "llmw-media";
     media.hidden = true;
+    // One button wide, so ✦ is not something the hand reaches by accident on
+    // the way to ⏏ or ⧉. It sits before the run button rather than after a
+    // particular neighbour, because ⏏ is hidden for Gemini.
+    const gap = document.createElement("span");
+    gap.className = "llmw-gap";
 
     // The status stretches so the buttons stay together in the bottom-right
     // corner of the node, with the run button in the corner itself.
-    bar.append(status, settingsButton, copyButton, unloadButton, runButton);
+    bar.append(status, settingsButton, clearButton, copyButton, unloadButton, gap, runButton);
     wrap.append(media, bar);
     // The canvas would otherwise zoom while the pointer sits over the toolbar.
     wrap.addEventListener("wheel", (event) => {
@@ -919,12 +1002,14 @@ function installToolbar(node) {
     }
     widget.serialize = false;
     node.__llmwRun = runButton;
+    node.__llmwClear = clearButton;
     node.__llmwUnload = unloadButton;
     node.__llmwStatus = status;
     node.__llmwMedia = media;
     node.__llmwToolbar = widget;
-    // Added last and left there: the toolbar belongs under the answer field, so
-    // the run and copy buttons sit at the node's bottom-right corner.
+    // Added last and left there, which puts it under the question field — the
+    // run and copy buttons end up in the node's bottom-right corner, where the
+    // eye already is after typing.
     syncNode(node);
 }
 
@@ -967,13 +1052,28 @@ async function generate(node) {
                 request_id: requestId,
                 system_prompt: widgetText(node, "system_prompt"),
                 question,
+                // Sent whatever the mode: the server decides from its own
+                // settings whether the log is a conversation or just old text.
+                transcript: widgetText(node, "answer"),
                 resources,
             }),
         });
         const data = await response.json().catch(() => ({}));
         if (data?.cancelled) throw new DOMException("cancelled", "AbortError");
         if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
-        setWidgetText(node, "answer", String(data.answer || ""));
+        // `transcript` is only returned in continue mode, and it already has
+        // this turn appended.
+        const transcript = String(data.transcript || "");
+        setWidgetText(node, "answer", transcript || String(data.answer || ""));
+        if (transcript) {
+            // The question now lives in the log, so the box is free for the next
+            // one — the way a chat input clears itself once the message is sent.
+            setWidgetText(node, "question", "");
+            // The newest turn is at the bottom, which is not where a textarea
+            // that has just been refilled is looking.
+            const field = widgetField(node, "answer");
+            if (field) field.scrollTop = field.scrollHeight;
+        }
         if (Array.isArray(data.skipped) && data.skipped.length) {
             notify(TEXT.mediaSkipped + data.skipped.join(", "), "warn");
         }
@@ -1016,6 +1116,22 @@ async function unloadModel(node) {
         // syncNode owns the disabled state while a generation is pending.
         button.disabled = Boolean(node.__llmwPending);
     }
+}
+
+/**
+ * Empty the log so the next question starts a new conversation.
+ *
+ * There is no history anywhere else — what the answer field holds *is* the
+ * conversation — so this asks first.
+ */
+function clearConversation(node) {
+    const button = node?.__llmwClear;
+    if (!button || button.disabled) return;
+    if (!widgetText(node, "answer").trim()) return;
+    const ask = globalThis.confirm;
+    if (typeof ask === "function" && !ask.call(globalThis, TEXT.clearConfirm)) return;
+    setWidgetText(node, "answer", "");
+    notify(TEXT.cleared, "info");
 }
 
 function cancelGeneration(node) {
@@ -1067,6 +1183,9 @@ function installNode(nodeType, nodeData) {
         // Links only exist once the whole graph is loaded, so a workflow opened
         // from disk gets its chips here rather than at node creation.
         const result = onAfterGraphConfigured?.apply(this, arguments);
+        // syncNode too: a workflow opened after the settings were already
+        // fetched gets no other chance to pick up the continue-mode styling.
+        syncNode(this);
         syncMediaLine(this, { force: true });
         return result;
     };
@@ -1095,6 +1214,7 @@ function installStyle() {
       .llmw-tool[hidden] { display: none !important; }
       .llmw-tool:disabled { cursor: default; opacity: .4; }
       .llmw-tool:disabled:hover { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.05); color: rgba(227,227,227,.62); }
+      .llmw-gap { width: 26px; height: 26px; flex: 0 0 26px; pointer-events: none; }
       .llmw-tool.is-run { font-size: 15px; }
       .llmw-tool.is-run.is-configured { color: #a8c7fa; border-color: rgba(168,199,250,.3); }
       .llmw-tool.is-run.is-stop { color: #f28b82; border-color: rgba(242,139,130,.45); background: rgba(242,139,130,.12); font-size: 11px; }
@@ -1107,6 +1227,9 @@ function installStyle() {
         border-radius: 999px; background: rgba(255,255,255,.04); color: rgba(227,227,227,.6); font-size: 10px; line-height: 16px;
       }
       .llmw-chip.is-missing { border-color: rgba(242,139,130,.35); color: rgba(242,139,130,.85); text-decoration: line-through; }
+      /* The answer field in continue mode. Only the face changes: it is still
+         ComfyUI's own textarea, with its IME handling, resizing and undo. */
+      textarea.llmw-log { font-family: ui-monospace, "Cascadia Mono", Consolas, "Noto Sans Mono", monospace; line-height: 1.45; }
 
       .llmw-overlay {
         --llmw-bg: #1c1e23; --llmw-surface: #26282e; --llmw-text: #e3e3e3; --llmw-muted: #a8adb8;

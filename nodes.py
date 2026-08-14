@@ -53,6 +53,16 @@ THINKING_OFF = "off"
 THINKING_KEEP = "keep"
 THINKING_MODES = (THINKING_OFF, THINKING_KEEP)
 
+# Continue mode keeps the whole conversation in the answer widget, written as an
+# IRC-style log. A native textarea is the only editor this node has, so the log
+# has to be plain text the user can read, edit and delete lines from — and the
+# markers are what turns it back into chat messages.
+CHAT_USER_MARK = "<you>"
+CHAT_MODEL_MARK = "<llm>"
+HISTORY_TURNS_DEFAULT = 8
+HISTORY_TURNS_MIN = 1
+HISTORY_TURNS_LIMIT = 64
+
 HTTP_TIMEOUT_SECONDS = 600
 # Freeing a model is quick; a request that hangs here should not sit for the ten
 # minutes a generation is allowed.
@@ -114,6 +124,8 @@ CONFIG_DEFAULTS = {
     "thinking": THINKING_OFF,
     "temperature": 0.35,
     "max_length": MAX_LENGTH_DEFAULT,
+    "continue_chat": False,
+    "history_turns": HISTORY_TURNS_DEFAULT,
     "gguf_model": "",
     "gguf_mmproj": GGUF_MMPROJ_AUTO,
     "gguf_context": GGUF_CONTEXT,
@@ -182,6 +194,8 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
         "thinking": thinking,
         "temperature": round(temperature, 3),
         "max_length": integer("max_length", MAX_LENGTH_DEFAULT, MAX_LENGTH_MIN, MAX_LENGTH_LIMIT),
+        "continue_chat": _as_bool(source.get("continue_chat"), False),
+        "history_turns": integer("history_turns", HISTORY_TURNS_DEFAULT, HISTORY_TURNS_MIN, HISTORY_TURNS_LIMIT),
         "gguf_model": str(source.get("gguf_model") or "").strip(),
         "gguf_mmproj": mmproj,
         "gguf_context": integer("gguf_context", GGUF_CONTEXT, GGUF_CONTEXT_MIN, GGUF_CONTEXT_LIMIT),
@@ -434,6 +448,80 @@ def _clean_output(text: Any, strip_thinking: bool = True) -> str:
     if match and match.group(1).lower() in _PLAIN_FENCE_LANGS:
         value = match.group(2)
     return value.strip()
+
+
+# --------------------------------------------------------------------------- #
+# Conversation transcript
+# --------------------------------------------------------------------------- #
+
+# A marker only counts at the start of a line, so an answer that merely mentions
+# `<llm>` mid-sentence does not split a turn. Everything before the first marker
+# is not part of the conversation: it is whatever the widget already held when
+# continue mode was switched on, and it is left in the box rather than deleted.
+_CHAT_TURN_RE = re.compile(
+    rf"^(?:{re.escape(CHAT_USER_MARK)}|{re.escape(CHAT_MODEL_MARK)})[ \t]*", flags=re.M
+)
+
+
+def _parse_transcript(text: Any) -> list[dict[str, str]]:
+    """Read the IRC-style log in the answer widget back into chat messages."""
+    value = str(text or "")
+    marks = list(_CHAT_TURN_RE.finditer(value))
+    turns: list[dict[str, str]] = []
+    for index, mark in enumerate(marks):
+        end = marks[index + 1].start() if index + 1 < len(marks) else len(value)
+        content = value[mark.end():end].strip()
+        if not content:
+            continue
+        role = "user" if mark.group(0).startswith(CHAT_USER_MARK) else "assistant"
+        turns.append({"role": role, "content": content})
+    return turns
+
+
+def _history_messages(transcript: Any, limit: int) -> list[dict[str, str]]:
+    """The previous turns to replay, newest `limit` exchanges kept.
+
+    Consecutive turns of the same role are merged because a hand-edited log can
+    hold two questions in a row, and Gemini rejects that outright. After merging
+    the list strictly alternates, so dropping a leading assistant turn is all it
+    takes to start the replay on a user message.
+    """
+    merged: list[dict[str, str]] = []
+    for turn in _parse_transcript(transcript):
+        if merged and merged[-1]["role"] == turn["role"]:
+            merged[-1]["content"] += "\n\n" + turn["content"]
+        else:
+            merged.append(dict(turn))
+    limit = max(0, int(limit))
+    if limit:
+        merged = merged[-(limit * 2):]
+    if merged and merged[0]["role"] != "user":
+        merged.pop(0)
+    return merged
+
+
+def _last_answer(transcript: Any) -> str:
+    """The reply the node hands downstream: the last `<llm>` block, or the lot.
+
+    An unmarked widget is a plain answer from before continue mode was switched
+    on (or written by hand), so it is returned as it stands.
+    """
+    value = str(transcript or "")
+    turns = _parse_transcript(value)
+    for turn in reversed(turns):
+        if turn["role"] == "assistant":
+            return turn["content"]
+    return "" if turns else value.strip()
+
+
+def _append_turn(transcript: Any, question: str, answer: str) -> str:
+    """Add one exchange to the log, keeping what is already in the widget."""
+    block = (
+        f"{CHAT_USER_MARK} {str(question).strip()}\n\n"
+        f"{CHAT_MODEL_MARK} {str(answer).strip()}"
+    )
+    base = str(transcript or "").rstrip()
+    return f"{base}\n\n{block}" if base else block
 
 
 # --------------------------------------------------------------------------- #
@@ -902,6 +990,7 @@ def _http_generate(
     system_prompt: str,
     user_prompt: str,
     media_parts: Sequence[Mapping[str, Any]] | None = None,
+    history: Sequence[Mapping[str, str]] | None = None,
 ) -> str:
     api_format = str(settings.get("api_format") or FORMAT_OPENAI)
     api_url = str(settings.get("api_url") or "")
@@ -911,10 +1000,11 @@ def _http_generate(
     no_think = str(settings.get("thinking") or THINKING_OFF).lower() != THINKING_KEEP
     url = _normalize_url(api_url, api_format, model)
     media_parts = list(media_parts or [])
+    history = list(history or [])
     started = time.perf_counter()
     _log(
-        "asking %s (model=%s, system=%d chars, question=%d chars, media parts=%d, thinking=%s)",
-        api_format, model or "?", len(system_prompt), len(user_prompt), len(media_parts),
+        "asking %s (model=%s, system=%d chars, question=%d chars, media parts=%d, history=%d turns, thinking=%s)",
+        api_format, model or "?", len(system_prompt), len(user_prompt), len(media_parts), len(history),
         "off" if no_think else "kept",
     )
     if api_format == FORMAT_GEMINI:
@@ -927,8 +1017,19 @@ def _http_generate(
             f"{system_prompt}\n\n=== QUESTION ===\n{user_prompt}"
             if system_prompt.strip() else user_prompt
         )
+        # Earlier turns carry text only: their media was resolved from files that
+        # may be gone by now, and re-encoding every image of the conversation on
+        # each turn would cost more than it is worth.
+        contents = [
+            {
+                "role": "user" if message["role"] == "user" else "model",
+                "parts": [{"text": message["content"]}],
+            }
+            for message in history
+        ]
+        contents.append({"role": "user", "parts": [{"text": text}, *media_parts]})
         payload: dict[str, Any] = {
-            "contents": [{"role": "user", "parts": [{"text": text}, *media_parts]}],
+            "contents": contents,
             "generationConfig": {"temperature": temperature, "maxOutputTokens": HTTP_MAX_OUTPUT_TOKENS},
         }
     else:
@@ -937,6 +1038,7 @@ def _http_generate(
         messages: list[dict[str, Any]] = []
         if system_prompt.strip():
             messages.append({"role": "system", "content": system_prompt})
+        messages.extend({"role": message["role"], "content": message["content"]} for message in history)
         messages.append({"role": "user", "content": content})
         payload = {
             "model": model,
@@ -1259,6 +1361,7 @@ def _gguf_chat(
     gemma: bool,
     should_stop=None,
     no_think: bool = True,
+    history: Sequence[Mapping[str, str]] | None = None,
 ) -> str:
     """One llama-cpp turn with reasoning off and cancellation wired in."""
     # Qwen switches reasoning off with an inline token; Gemma has no equivalent
@@ -1269,6 +1372,9 @@ def _gguf_chat(
     messages: list[dict[str, Any]] = []
     if str(system_prompt or "").strip():
         messages.append({"role": "system", "content": system_prompt})
+    # Text only, like the HTTP path: an image from an earlier turn would have to
+    # be re-projected through the vision handler on every following turn.
+    messages.extend({"role": message["role"], "content": message["content"]} for message in (history or []))
     messages.append({"role": "user", "content": content})
     request = {
         "messages": messages,
@@ -1366,6 +1472,7 @@ def _gguf_generate(
     should_stop=None,
     context: str = "",
     keep_vision: bool = False,
+    history: Sequence[Mapping[str, str]] | None = None,
 ) -> str:
     """Run the question through a local GGUF and return the answer."""
     images = [part for part in (media_parts or []) if part.get("type") == "image_url"]
@@ -1374,8 +1481,9 @@ def _gguf_generate(
     # the text-only final pass reuses that model instead of reloading it.
     llm, vision = _gguf_model(settings, bool(images) or keep_vision)
     _log(
-        "asking GGUF %s (system=%d chars, question=%d chars, images=%d, descriptions=%d chars)",
+        "asking GGUF %s (system=%d chars, question=%d chars, images=%d, descriptions=%d chars, history=%d turns)",
         str(settings.get("gguf_model") or ""), len(system_prompt), len(user_prompt), len(images), len(context),
+        len(history or []),
     )
     if images and not vision:
         logging.warning(LOG_PREFIX + "no vision projector for this GGUF; answering from text only.")
@@ -1390,7 +1498,9 @@ def _gguf_generate(
     no_think = str(settings.get("thinking") or THINKING_OFF).lower() != THINKING_KEEP
     _log("generating (max_tokens=%d, images=%d, thinking=%s)...", max_tokens, len(images), "off" if no_think else "kept")
     try:
-        text = _gguf_chat(llm, system_prompt, user_text, images, max_tokens, temperature, gemma, should_stop, no_think)
+        text = _gguf_chat(
+            llm, system_prompt, user_text, images, max_tokens, temperature, gemma, should_stop, no_think, history,
+        )
     except _Cancelled:
         # Stopping hands the VRAM back. Keeping a model resident for a
         # generation the user abandoned is the opposite of what they asked for.
@@ -1416,13 +1526,20 @@ def _generate(
     question: str,
     media_items: Sequence[Mapping[str, Any]],
     should_stop=None,
+    transcript: str = "",
 ) -> str:
     """Run one question through the configured backend.
 
     `media_items` are already-resolved parts, so the same pipeline serves the
-    editor route (file paths) and node execution (tensors).
+    editor route (file paths) and node execution (tensors). `transcript` is the
+    raw answer widget; parsing it here means the log the user sees is the only
+    definition of what the conversation is.
     """
     api_format = str(settings.get("api_format") or FORMAT_OPENAI).lower()
+    history = (
+        _history_messages(transcript, settings.get("history_turns", HISTORY_TURNS_DEFAULT))
+        if _as_bool(settings.get("continue_chat")) else []
+    )
     local = api_format == FORMAT_GGUF
     # Held for the whole local run, describe pass included, so an Unload pressed
     # mid-generation is refused instead of freeing a model that is in use.
@@ -1437,8 +1554,10 @@ def _generate(
         media_parts = [part for item in attached for part in item["parts"]]
         system = _system_prompt(system_prompt, attached, described_count)
         if local:
-            return _gguf_generate(settings, system, question, media_parts, should_stop, described, describe)
-        return _http_generate(settings, system, question, media_parts)
+            return _gguf_generate(
+                settings, system, question, media_parts, should_stop, described, describe, history,
+            )
+        return _http_generate(settings, system, question, media_parts, history)
     finally:
         if local:
             _gguf_hold(-1)
@@ -1572,6 +1691,9 @@ def _register_routes() -> bool:
             request_id = str(payload.get("request_id") or "")
             question = str(payload.get("question") or "")
             system = str(payload.get("system_prompt") or "")
+            # The answer widget verbatim. In continue mode it is the log the
+            # previous turns were written into; otherwise it is ignored.
+            transcript = str(payload.get("transcript") or "")
             if not question.strip():
                 return web.json_response({"ok": False, "error": "Type a question first"}, status=400)
             settings = _read_config()
@@ -1588,12 +1710,19 @@ def _register_routes() -> bool:
             # generation instead of only freeing the editor.
             should_stop = (lambda: _is_cancelled(request_id)) if request_id else None
             _raise_if_cancelled(request_id)
-            answer = await asyncio.to_thread(_generate, settings, system, question, items, should_stop)
+            answer = await asyncio.to_thread(
+                _generate, settings, system, question, items, should_stop, transcript,
+            )
             # An HTTP request cannot be interrupted mid-flight, so a late cancel
             # is honoured by throwing the answer away.
             _raise_if_cancelled(request_id)
             skipped = [item["tag"] for item in items if not item.get("parts")]
-            return web.json_response({"ok": True, "answer": answer, "skipped": skipped})
+            # The log is formatted here rather than in the editor so the markers
+            # the parser reads and the ones written are the same two constants.
+            updated = _append_turn(transcript, question, answer) if _as_bool(settings.get("continue_chat")) else ""
+            return web.json_response(
+                {"ok": True, "answer": answer, "transcript": updated, "skipped": skipped},
+            )
         except _Cancelled as exc:
             # Nothing is running in a worker thread at this point, so freeing a
             # model the cancelled run had loaded is safe here.
@@ -1668,15 +1797,24 @@ class LLMWidget:
 
     @classmethod
     def INPUT_TYPES(cls):
+        # The order is the layout: `answer` sits above `question`, so a
+        # continue-mode log reads top to bottom and the question box ends up at
+        # the bottom of the node with the ✦ button directly under it — a chat
+        # input below its own transcript. `generate_on_execute` is a setting
+        # rather than part of that flow, so it goes above both instead of
+        # between the question and the button. It stays this way in both modes
+        # because `widgets_values` is serialized by *index*: an order that
+        # followed the setting would swap `question` and `answer` in every
+        # workflow saved under the other one.
         return {
             "required": {
                 "system_prompt": ("STRING", {"multiline": True, "default": DEFAULT_SYSTEM_PROMPT}),
-                "question": ("STRING", {"multiline": True, "default": ""}),
-                "answer": ("STRING", {"multiline": True, "default": ""}),
                 # Off by default: the point of this node is to answer in the
                 # editor, so an execution normally just hands the stored answer
                 # to whatever is wired to the output.
                 "generate_on_execute": ("BOOLEAN", {"default": False}),
+                "answer": ("STRING", {"multiline": True, "default": ""}),
+                "question": ("STRING", {"multiline": True, "default": ""}),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -1689,15 +1827,20 @@ class LLMWidget:
     def IS_CHANGED(cls, **kwargs):
         return float("nan")
 
-    def run(self, system_prompt, question, answer, generate_on_execute, image=None, video=None, unique_id=None):
+    # ComfyUI calls this with keyword arguments, so the order here is only for
+    # reading; it follows INPUT_TYPES.
+    def run(self, system_prompt, generate_on_execute, answer, question, image=None, video=None, unique_id=None):
         stored = str(answer or "")
+        # Downstream wants the reply, never the log around it, so the widget is
+        # reduced to its last `<llm>` block. Without continue mode there are no
+        # markers in it and this is the stored answer unchanged.
         if not _as_bool(generate_on_execute):
             if not stored.strip():
                 logging.warning(
                     LOG_PREFIX + "the answer is empty. Click the run button on the node, "
                     "or enable generate_on_execute."
                 )
-            return (stored,)
+            return (_last_answer(stored),)
         settings = _read_config()
         problem = _validate(settings)
         if problem:
@@ -1710,8 +1853,13 @@ class LLMWidget:
             _execution_media_items(image, video, parts_format)
             if _as_bool(settings.get("read_media"), True) else []
         )
-        text = _generate(settings, str(system_prompt or ""), str(question), items)
-        _notify_answer(unique_id, text)
+        text = _generate(settings, str(system_prompt or ""), str(question), items, None, stored)
+        # The editor gets the widget's new contents — the whole log in continue
+        # mode — while the output socket carries the reply on its own.
+        _notify_answer(
+            unique_id,
+            _append_turn(stored, str(question), text) if _as_bool(settings.get("continue_chat")) else text,
+        )
         return (text,)
 
 

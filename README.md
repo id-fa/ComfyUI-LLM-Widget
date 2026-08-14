@@ -85,13 +85,21 @@ C:\AI\ComfyUI\python_embeded\python.exe -c "from llama_cpp.llama_chat_format imp
 ウィジェット:
 
 - **toolbar** — ✦ 実行（リクエスト中は ■ 停止に変わる）、経過時間、⏏ モデルを解放（Gemini 以外で
-  表示）、⧉ 答えをコピー、⚙ 設定。その上には、接続したメディアごとに実際に送られるものを示す
-  チップが並びます。
+  表示）、⧉ 答えをコピー、⌫ 会話を消去（continue モードのときだけ表示）、⚙ 設定。その上には、
+  接続したメディアごとに実際に送られるものを示すチップが並びます。
 - **system_prompt** — 自由記述。ワークフローと一緒に保存されます。「テンプレート」と呼べるものは
   これだけです。
-- **question** — 質問内容。
-- **answer** — 答えが入る場所。編集可能で、ワークフローと一緒に保存されます。
 - **generate_on_execute** — 既定はオフ。下記参照。
+- **answer** — 答えが入る場所。編集可能で、ワークフローと一緒に保存されます。continue モードでは
+  ここが会話ログそのものになります（*会話を続ける* を参照）。
+- **question** — 質問内容。会話ログの下、✦ ボタンのすぐ上に置いてあります。
+
+ウィジェットの並びはモードによらず固定です。ComfyUI はウィジェットの値を **順番（インデックス）**
+で保存するため、設定によって並びを変えると、一方のモードで保存したワークフローをもう一方で開いた
+ときに `question` と `answer` が入れ替わってしまいます。
+
+> **0.1.1 以前で保存したワークフロー** は `question` と `answer` が逆に読み込まれます。
+> 一度だけ手で入れ替えて保存し直してください。
 
 |ノード|設定画面|
 |--|--|
@@ -139,9 +147,42 @@ Reroute ノードは辿って追跡します。
 | Model thinking | 全て | `Off`（既定）または `Keep` — *推論（thinking）* を参照 |
 | Temperature | 全て | |
 | Max answer tokens | 全て | ローカルバックエンドでは `max_tokens`。答えの長さの上限 |
+| Continue the conversation | 全て | 前回までのやり取りも一緒に送ります — *会話を続ける* を参照 |
+| Exchanges kept in the history | 全て | 送るやり取りの上限（新しい方から数えて何往復ぶんか） |
 | Unload after answering | gguf | モデルを常駐させず、すぐに VRAM を解放。オフのままでもツールバーの ⏏ でいつでも解放できます |
 | Send the connected image / video | 全て | オフにすると質問は純粋なテキストとして送られます |
 | Describe each media in its own pass | gguf | 下記参照 |
+
+### 会話を続ける（continue モード）
+
+`Continue the conversation` をオンにすると、`answer` ウィジェットが IRC のログのような
+会話ログになります。1 回のやり取りごとに次の 2 ブロックが追記され、次の質問にはその上の
+やり取りが一緒に送られます。
+
+```
+<you> 猫の写真のプロンプトを書いて
+
+<llm> a photograph of a tabby cat sitting on a windowsill, ...
+
+<you> もう少し夕方っぽく
+
+<llm> a photograph of a tabby cat sitting on a windowsill at golden hour, ...
+```
+
+会話の実体はこのテキストだけです。どこにも別の履歴は持っていません。つまり **行を書き換えれば
+モデルの記憶が変わり、消せば忘れます**。ウィジェットは普通のテキストボックスのままなので、
+IME も、リサイズも、undo も今までどおり効きます。ワークフローと一緒に保存されるので、
+会話の続きは次に開いたときにも残っています。
+
+- 質問を送ると `question` は空になります。質問はログの中に入っているためです。
+- ⌫ でログ全体を消せます（確認あり）。continue モードのときだけ表示されます。
+- 最初のマーカーより前にある文字列は会話の一部として扱いません。モードを切り替える前から
+  入っていた答えなので、勝手に消さずそのまま残します。
+- 過去のやり取りは **テキストだけ** を送ります。画像や動画は今回の質問にだけ付きます。
+- ノードの `text` 出力に出るのは常に **最後の `<llm>` ブロックだけ** です。ログ全体が流れて
+  下流を壊すことはありません。⧉ でコピーされるのも同じくその答えだけです。
+- 会話が伸びればコンテキストを食います。`Exchanges kept in the history` で送る往復数を、
+  ローカル GGUF なら `Context size` も合わせて調整してください。
 
 ### `Describe each media in its own pass`（GGUF）
 
@@ -319,13 +360,22 @@ it back with `pip install --upgrade "numpy<2.3"` (same idea for `"pillow<12"`).
 Widgets:
 
 - **toolbar** — ✦ run (becomes ■ stop while a request is in flight), elapsed time, ⏏ unload
-  the model (shown for every backend but Gemini), ⧉ copy the answer, ⚙ settings. Above it, a
-  chip per connected media shows what will actually be sent.
+  the model (shown for every backend but Gemini), ⧉ copy the answer, ⌫ clear the conversation
+  (shown in continue mode only), ⚙ settings. Above it, a chip per connected media shows what
+  will actually be sent.
 - **system_prompt** — free text, saved with the workflow. This is the only "template"
   there is.
-- **question** — what you are asking.
-- **answer** — where the result lands. Editable; saved with the workflow.
 - **generate_on_execute** — off by default, see below.
+- **answer** — where the result lands. Editable; saved with the workflow. In continue mode this
+  is the conversation log itself, see *Continuing the conversation*.
+- **question** — what you are asking. It sits below the log, right above the ✦ button.
+
+The order is the same in both modes. ComfyUI serializes widget values **by index**, so an order
+that followed the setting would load a workflow saved under one mode with `question` and `answer`
+swapped under the other.
+
+> **Workflows saved with 0.1.1 or earlier** load with `question` and `answer` swapped. Swap them
+> back once and save.
 
 ### Connected media
 
@@ -370,9 +420,42 @@ API key** and is gitignored.
 | Model thinking | all | `Off` (default) or `Keep` — see *Reasoning* |
 | Temperature | all | |
 | Max answer tokens | all | `max_tokens` for the local backends, the answer length cap |
+| Continue the conversation | all | Send the earlier turns along with the question — see *Continuing the conversation* |
+| Exchanges kept in the history | all | How many of the most recent exchanges are replayed |
 | Unload after answering | gguf | Frees VRAM immediately instead of keeping the model resident. Leave it off and use the toolbar's ⏏ when you want the VRAM back |
 | Send the connected image / video | all | Off means the question is asked as pure text |
 | Describe each media in its own pass | gguf | See below |
+
+### Continuing the conversation
+
+With `Continue the conversation` on, the `answer` widget becomes an IRC-style log. Every turn
+appends two blocks to it, and the exchanges above the question are sent with the next one:
+
+```
+<you> Write a prompt for a photo of a cat
+
+<llm> a photograph of a tabby cat sitting on a windowsill, ...
+
+<you> More like early evening
+
+<llm> a photograph of a tabby cat sitting on a windowsill at golden hour, ...
+```
+
+That text is the entire conversation — there is no history stored anywhere else. **Edit a line
+and you change what the model remembers; delete one and it forgets.** The widget is still an
+ordinary text box, so IME composition, resizing and undo all work as before, and the log is
+saved with the workflow like any other widget value.
+
+- Sending a question clears the `question` box, since the question is in the log by then.
+- ⌫ clears the whole log (it asks first). It is only shown in continue mode.
+- Anything above the first marker is not treated as part of the conversation. It is whatever
+  the field held before the mode was switched on, and it is left alone rather than deleted.
+- Earlier turns are sent as **text only**; a connected image or video is attached to the
+  current question.
+- The node's `text` output is always the **last `<llm>` block alone**, so the whole log never
+  leaks into whatever is wired downstream. ⧉ copies that same reply.
+- A long conversation costs context. Tune `Exchanges kept in the history` — and, for a local
+  GGUF, `Context size` with it.
 
 ### `Describe each media in its own pass` (GGUF)
 
