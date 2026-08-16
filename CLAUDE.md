@@ -58,6 +58,28 @@ An unresolvable media is *kept* as an item with empty `parts` so the run can rep
 skipped (`skipped` in the response, red struck-through chip in the toolbar) rather than silently
 answering about nothing. Do not "simplify" that by dropping the item.
 
+## Video sampling
+
+A chat message has no video channel, so a video becomes stills: `_video_still_parts` from a file,
+`_tensor_video_parts` (through `_sample_frames`) from the tensors an execution receives. Both take
+candidates at `VIDEO_SAMPLE_RATE` fps, then spend the `video_sample` budget with
+`_select_change_frames` — first frame, last frame, and the rest on the candidates that differ most
+from the one before them (`_still_change_scores` on a `VIDEO_SAMPLE_SCORE_SIDE` grayscale
+thumbnail, `_tensor_change_scores` by striding the tensor). Evenly spaced stills kept sending a
+held shot several times over while the cut in the middle went unseen; that is what this replaces.
+The candidate set itself is capped at `VIDEO_SAMPLE_MAX_CANDIDATES`, because 1 fps over a long clip
+decodes a few hundred frames only to throw most of them away.
+
+**Because that selection is uneven, every path that sends it also states the timestamps**
+(`_video_sample_detail`). Both samplers therefore return `(parts, times, duration)`, the times ride
+on the media item (`times` / `duration`) and reach the model through `_media_manifest` and
+`VIDEO_STILLS_REQUEST`. Dropping them is not cosmetic: `0.0s / 5.0s / 6.0s / 10.0s` read as four
+equal steps turns a held shot and a cut into a slow continuous move. When the times are unknown the
+wording falls back to `VIDEO_SAMPLE_ORDER` rather than inventing any.
+
+An IMAGE *batch* is not a clip — it has no timeline to reason about — so `_tensor_still_parts`
+keeps thinning it evenly. Gemini never uses any of this: it takes the file whole.
+
 ## Backends
 
 `_generate` is the single entry point shared by the route and by execution. It takes
@@ -92,13 +114,18 @@ the editor appears to freeze. Because that pass loads the projector, the final t
 `keep_vision=True`; without it the signature would change and the model would be reloaded between
 the two.
 
-Two things that mode gets wrong if you are not careful, both found with Gemma 4:
+Three things that mode gets wrong if you are not careful, found with Gemma 4 and Qwen3.8:
 
 - **The describe pass has its own token budget, and a model that cannot be told to stop reasoning
   spends it on the thought.** `DESCRIBE_LENGTH` alone left Gemma stopping mid-thought, so
   `_clean_output` correctly returned nothing at all and *every* description came back empty.
   `DESCRIBE_THINKING_HEADROOM` is added for the families with no working switch (gemma), and is
   deliberately not tied to `max_length`: it buys room for text that is discarded either way.
+- **A vision chat handler renders no chat template**, so neither switch reaches the model on the
+  describe path and the budget is the only lever left. `_gguf_chat` raises `_ThinkingOverflow` for
+  exactly that failure, and `_gguf_describe` retries the media with `DESCRIBE_THINKING_HEADROOM` on
+  top and keeps the raised budget for the rest of the run — one wasted pass, not one lost
+  description per media.
 - **A describe pass that produced nothing must not be treated as "no media was connected".**
   `_generate` falls back to the single-prompt path (`describe = False`) and logs it. Without that
   the final pass got no parts *and* no media rule, and the model answered — reasonably — that
@@ -154,6 +181,9 @@ The `thinking` setting is `off` (default) or `keep`; `off` means *both* "send th
    `_thinking_off_payload`, and `_http_post` retries once **without** them on 400/404/422, because
    an endpoint that has never heard of `chat_template_kwargs` answers with an error rather than
    ignoring it. `_gguf_call` does the same for llama-cpp builds too old to accept the argument.
+   Qwen3.8 reads the *depth* rather than the switch and defaults to `xhigh`, hence
+   `REASONING_EFFORT = "low"`; both fields go in the same dict because older templates read only
+   `enable_thinking`, and `none` is not a value that template accepts.
 2. **`_clean_output` required an opening `<think>`.** Most Qwen chat templates *pre-open* the tag
    in the assistant turn, so the response begins with bare reasoning prose and the only tag in it
    is the closing one — the whole block leaked. `_THINK_CLOSE_RE` therefore makes the opening tag
@@ -207,8 +237,9 @@ frontend versions.
 
 Constants duplicated between `nodes.py` and `web/llm_widget_ui.js` must be edited in both: the
 route paths under `/llm_widget/`, `ANSWER_EVENT`, the three format ids, `GGUF_MMPROJ_AUTO` /
-`GGUF_MMPROJ_NONE`, `CHAT_USER_MARK` / `CHAT_MODEL_MARK`, and every settings key with its clamp
-range (both sides normalize independently, and the server's normalization is authoritative).
+`GGUF_MMPROJ_NONE`, `CHAT_USER_MARK` / `CHAT_MODEL_MARK`, the `VIDEO_SAMPLES` ids, and every
+settings key with its clamp range (both sides normalize independently, and the server's
+normalization is authoritative).
 
 ## Conventions
 

@@ -64,12 +64,29 @@ const MEDIA_INPUTS = [
 const MEDIA_EXTENSIONS = /\.(png|jpe?g|webp|gif|bmp|tiff?|mp4|webm|mov|mkv|avi|m4v)$/i;
 const ANNOTATED_PATH_RE = /\s*\[(input|output|temp)\]\s*$/i;
 
+// Mirrors VIDEO_SAMPLES in nodes.py: how many stills a connected video becomes
+// before it is shown to the model. The server samples candidates at 1 fps,
+// always keeps the first and the last frame, and spends what is left of the
+// budget on the frames that changed most from the one before them. The values
+// are the canonical ids the server accepts; the labels are display only.
+const VIDEO_SAMPLE_MIN = 2;
+const VIDEO_SAMPLE_MAX = 12;
+const VIDEO_SAMPLE_DEFAULT = "4frames";
+const VIDEO_SAMPLES = Array.from(
+    { length: VIDEO_SAMPLE_MAX - VIDEO_SAMPLE_MIN + 1 },
+    (_unused, index) => {
+        const count = VIDEO_SAMPLE_MIN + index;
+        return { value: `${count}frames`, label: `${count} frames` };
+    },
+);
+
 const SETTINGS_DEFAULTS = Object.freeze({
     api_format: FORMAT_OPENAI,
     api_url: "",
     api_key: "",
     model: "",
     read_media: true,
+    video_sample: VIDEO_SAMPLE_DEFAULT,
     thinking: THINKING_OFF,
     temperature: 0.35,
     max_length: MAX_LENGTH_DEFAULT,
@@ -112,6 +129,11 @@ const TEXT = {
     ggufUnload: "Unload the model after answering",
     ggufDescribe: "Describe each media in its own pass",
     readMedia: "Send the connected image / video",
+    videoSample: "Video frames sent",
+    videoSampleHint:
+        "A chat request has no video channel, so a connected video is sent as stills. Candidates are "
+        + "taken at one per second; the first and the last frame are always kept and the rest of the "
+        + "budget goes to the frames that changed most, with their timestamps stated in the request.",
     continueChat: "Continue the conversation",
     historyTurns: "Exchanges kept in the history",
     chatBlankLines: "Blank line between the log entries",
@@ -168,6 +190,11 @@ function clampNumber(raw, fallback, low, high, round = true) {
     return Math.min(high, Math.max(low, round ? Math.round(number) : number));
 }
 
+function canonicalVideoSample(value) {
+    const requested = String(value || "").trim().toLowerCase();
+    return VIDEO_SAMPLES.some((item) => item.value === requested) ? requested : VIDEO_SAMPLE_DEFAULT;
+}
+
 function normalizeSettings(value) {
     const source = value && typeof value === "object" ? value : {};
     const requested = String(source.api_format || FORMAT_OPENAI).toLowerCase();
@@ -177,6 +204,7 @@ function normalizeSettings(value) {
         api_key: String(source.api_key || ""),
         model: String(source.model || "").trim(),
         read_media: asBoolean(source.read_media, true),
+        video_sample: canonicalVideoSample(source.video_sample),
         thinking: THINKING_MODES.includes(String(source.thinking || "").toLowerCase())
             ? String(source.thinking).toLowerCase()
             : THINKING_OFF,
@@ -650,6 +678,7 @@ async function openSettings() {
     // seeding only auto/none silently reset a configured projector to auto —
     // and the catalog fetch below then "restored" that reset value.
     const ggufMmproj = makeSelect(settingsCache.gguf_mmproj, null, mmprojOptions(settingsCache.gguf_mmproj));
+    const videoSample = makeSelect(settingsCache.video_sample, null, VIDEO_SAMPLES);
     const readMedia = makeSwitch(settingsCache.read_media, () => syncFormatRows());
     const continueChat = makeSwitch(settingsCache.continue_chat, () => syncFormatRows());
     const chatBlankLines = makeSwitch(settingsCache.chat_blank_lines);
@@ -672,6 +701,10 @@ async function openSettings() {
     const ggufContextRow = makeRow(TEXT.ggufContext, ggufContext);
     const ggufGpuLayersRow = makeRow(TEXT.ggufGpuLayers, ggufGpuLayers);
     const readMediaRow = makeCheckRow(TEXT.readMedia, readMedia);
+    const videoSampleRow = makeRow(TEXT.videoSample, videoSample);
+    const videoSampleHint = document.createElement("p");
+    videoSampleHint.className = "llmw-hint";
+    videoSampleHint.textContent = TEXT.videoSampleHint;
     const continueChatRow = makeCheckRow(TEXT.continueChat, continueChat);
     const historyTurnsRow = makeRow(TEXT.historyTurns, historyTurns);
     const chatBlankLinesRow = makeCheckRow(TEXT.chatBlankLines, chatBlankLines);
@@ -702,6 +735,8 @@ async function openSettings() {
         ggufUnloadRow,
         readMediaRow,
         ggufDescribeRow,
+        videoSampleRow,
+        videoSampleHint,
     );
 
     const error = document.createElement("div");
@@ -740,6 +775,9 @@ async function openSettings() {
         for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadRow]) row.hidden = !gguf;
         // Describing media one at a time only means something once media is sent.
         ggufDescribeRow.hidden = !gguf || !readMedia.checked;
+        // So does how many frames a video is thinned to.
+        videoSampleRow.hidden = !readMedia.checked;
+        videoSampleHint.hidden = !readMedia.checked;
         // How much history to replay, and how the log is spaced, are only
         // questions once there is a log at all.
         historyTurnsRow.hidden = !continueChat.checked;
@@ -772,6 +810,7 @@ async function openSettings() {
         api_key: apiKey.value,
         model: model.value,
         read_media: readMedia.checked,
+        video_sample: videoSample.value,
         thinking: thinking.value,
         temperature: temperature.value,
         max_length: maxLength.value,
@@ -811,7 +850,7 @@ async function openSettings() {
     settingsModal = { dialog, close };
     document.addEventListener("keydown", onKeyDown, true);
     overlay.addEventListener("pointerdown", (event) => {
-        for (const select of [apiFormat, thinking, ggufModel, ggufMmproj]) {
+        for (const select of [apiFormat, thinking, ggufModel, ggufMmproj, videoSample]) {
             if (!select.contains?.(event.target)) select.closeMenu?.();
         }
         if (event.target === overlay) requestClose();

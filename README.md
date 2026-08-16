@@ -116,8 +116,15 @@ Reroute ノードは辿って追跡します。
 どちらなのかはツールバーのチップが示します。赤い取り消し線はそのメディアがスキップされることを
 意味し、実行結果でも警告として報告されます。黙って何もないまま答えさせることはしません。
 
-チャットメッセージには動画のチャンネルがないため、OpenAI と GGUF では動画から等間隔に 4 枚の
-静止画を抜き出して送ります。Gemini にはファイルをそのまま渡します。
+チャットメッセージには動画のチャンネルがないため、OpenAI と GGUF では動画を静止画にして送ります。
+候補は 1 秒に 1 枚ずつ取り、最初と最後のフレームは必ず残したうえで、残りの枠を **直前のフレーム
+からの変化量が大きい順** に埋めます。動きのないショットが何枚も送られる一方で途中のカットが
+まったく見えない、という等間隔サンプリングの弱点を避けるためです。枚数は `Video frames sent`
+（既定 4 枚、2〜12 枚）で決めます。
+
+間隔が等しくならないので、リクエストには各フレームの **タイムスタンプ**（`0.0s / 6.0s / 8.0s /
+10.0s のうち…`）も併記します。これを書かないと、止まっているショットとカットの並びが「4 秒間の
+ゆっくりした動き」として読まれてしまいます。Gemini にはファイルをそのまま渡します。
 
 ### 実行時の動作
 
@@ -152,6 +159,7 @@ Reroute ノードは辿って追跡します。
 | Blank line between the log entries | 全て | ログの各ブロックの間に空行を入れるか。オフで詰めた IRC ログになります |
 | Unload after answering | gguf | モデルを常駐させず、すぐに VRAM を解放。オフのままでもツールバーの ⏏ でいつでも解放できます |
 | Send the connected image / video | 全て | オフにすると質問は純粋なテキストとして送られます |
+| Video frames sent | 全て | 動画 1 本を何枚の静止画にするか（2〜12、既定 4）。Gemini はファイルをそのまま送るため無関係です |
 | Describe each media in its own pass | gguf | 下記参照 |
 
 ### 会話を続ける（continue モード）
@@ -260,6 +268,12 @@ IME も、リサイズも、undo も今までどおり効きます。ワーク�
 Gemini には `thinkingConfig.thinkingBudget=0`、Qwen 系には `/no_think`、llama-cpp の vision handler
 には `force_reasoning=False`。未知のフィールドを拒否するエンドポイントに対しては、それを外して
 もう一度送るので、厳格な API でもちゃんと答えが返ります。
+
+Qwen3.8 はオン／オフのスイッチを **深さ** に変えました。テンプレートが読むのは `reasoning_effort`
+で、既定は `xhigh` です。そのため `chat_template_kwargs` には `enable_thinking=false` と一緒に
+`reasoning_effort=low`（そのテンプレートが受け付ける最も浅い値。`none` は無効）も載せます。古い
+テンプレートは前者しか読まず、`reasoning_effort` を知らないテンプレートはそれを無視するだけなので、
+どちらのモデルでも同じリクエストが通ります。
 
 それでもモデルが吐いてしまったものは後処理で除去します。最後の `</think>` までが、その閉じタグ
 自体も含めて削除されます。閉じタグだけを手掛かりにしているのは意図的です。ほとんどの Qwen の
@@ -409,8 +423,17 @@ A chip in the toolbar tells you which it is — struck through and red means the
 will be skipped, and the run reports it as a warning rather than letting the model invent
 a description.
 
-Videos are sampled into 4 evenly spaced stills for the OpenAI and GGUF formats, since a
-chat message has no video channel. Gemini receives the file whole.
+Videos are sampled into stills for the OpenAI and GGUF formats, since a chat message has no
+video channel. Candidates are taken at one per second; the first and the last frame are
+always kept, and what is left of the budget goes to the frames that **changed most** from
+the one before them — so a held shot is not sent several times over while the cut in the
+middle of the clip goes unseen. How many stills you get is `Video frames sent` (4 by
+default, 2–12).
+
+Because that spacing is deliberately uneven, the request also states each still's
+**timestamp** (`at 0.0s / 6.0s / 8.0s / 10.0s of a 10.0s clip…`). Without it a held shot
+followed by a cut reads as four steady seconds of slow motion. Gemini receives the file
+whole.
 
 ### Execution
 
@@ -446,6 +469,7 @@ API key** and is gitignored.
 | Blank line between the log entries | all | Whether the log's blocks are separated by a blank line. Off gives a tight IRC log |
 | Unload after answering | gguf | Frees VRAM immediately instead of keeping the model resident. Leave it off and use the toolbar's ⏏ when you want the VRAM back |
 | Send the connected image / video | all | Off means the question is asked as pure text |
+| Video frames sent | all | How many stills one video becomes (2–12, default 4). Not used by Gemini, which gets the file whole |
 | Describe each media in its own pass | gguf | See below |
 
 ### Continuing the conversation
@@ -559,6 +583,12 @@ understand — `chat_template_kwargs.enable_thinking=false` for OpenAI-compatibl
 llama-cpp, `thinkingConfig.thinkingBudget=0` for Gemini, `/no_think` for the Qwen family,
 `force_reasoning=False` on the llama-cpp vision handler. An endpoint that rejects the
 unknown field gets the request again without it, so a stricter API still answers.
+
+Qwen3.8 turned that on/off switch into a **depth**: its template reads `reasoning_effort`
+and defaults to `xhigh`. `chat_template_kwargs` therefore carries `reasoning_effort=low` —
+the shallowest value the template accepts, `none` is not one of them — alongside
+`enable_thinking=false`, not instead of it: older templates read only the latter, and a
+template that has never heard of the variable simply ignores it.
 
 Whatever a model emits anyway is cleaned up afterwards: everything up to and including the
 **last** closing `</think>` is removed. The closing tag alone is enough on purpose — most

@@ -83,8 +83,27 @@ GGUF_CONTEXT_LIMIT = 1048576
 GGUF_GPU_LAYERS = -1
 
 # A chat message has no video channel, so a connected video is described from
-# evenly spaced stills instead.
+# stills instead. How many stills it becomes is a setting: candidates are taken
+# at VIDEO_SAMPLE_RATE fps, the first and the last frame are always kept, and
+# what is left of the budget goes to the candidates that changed most from the
+# one before them — so a held shot is not sent several times over while the cut
+# in the middle of the clip goes unseen. Duplicated in the JS as VIDEO_SAMPLES.
 VIDEO_STILLS = 4
+VIDEO_SAMPLE_MIN = 2
+VIDEO_SAMPLE_MAX = 12
+VIDEO_SAMPLES: tuple[str, ...] = tuple(
+    f"{count}frames" for count in range(VIDEO_SAMPLE_MIN, VIDEO_SAMPLE_MAX + 1)
+)
+VIDEO_SAMPLE_DEFAULT = "4frames"
+VIDEO_SAMPLE_RATE = 1.0
+# 1 fps over a long clip is a lot of decoding for frames that mostly get thrown
+# away, so the candidate set itself is capped and spread evenly beyond it.
+VIDEO_SAMPLE_MAX_CANDIDATES = 180
+# Change is measured on a small grayscale thumbnail: what matters is that the
+# composition moved, not that the encoder's noise did.
+VIDEO_SAMPLE_SCORE_SIDE = 48
+# What is said about the attached stills when their timestamps are unknown.
+VIDEO_SAMPLE_ORDER = "in chronological order"
 STILL_MAX_SIDE = 768
 # How many frames of a connected IMAGE batch are attached during execution.
 IMAGE_BATCH_STILLS = 4
@@ -100,6 +119,14 @@ DESCRIBE_LENGTH = 256
 # on text that is then thrown away, which is why only the models that cannot be
 # told to skip it get it.
 DESCRIBE_THINKING_HEADROOM = 768
+# Qwen3.8 turned the on/off switch into a depth: its template reads
+# `reasoning_effort` and defaults to `xhigh`, which spends a describe pass'
+# whole budget on the thought. `low` is the shallowest value it accepts ("none"
+# is not one of them), so it is sent alongside `enable_thinking` rather than
+# instead of it — a template that has never heard of the variable ignores it,
+# and the same request has to keep working for the models that only read the
+# older switch.
+REASONING_EFFORT = "low"
 DESCRIBE_SYSTEM = (
     "You describe one piece of media so another model can reason about it from your words alone.\n"
     "Report only what is actually present: subject, appearance, clothing, pose, setting, lighting, "
@@ -112,9 +139,9 @@ DESCRIBE_REQUESTS = {
     "video": "Describe this video.",
 }
 VIDEO_STILLS_REQUEST = (
-    "Describe this video. The {count} attached images are frames sampled from it in chronological "
-    "order, not separate pictures: describe the clip as a whole, including the action and camera "
-    "movement the frames show."
+    "Describe this video. The {count} attached images are frames sampled from it {detail}. They are "
+    "not separate pictures: describe the clip as a whole, including the action and camera movement "
+    "the frames show."
 )
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -129,6 +156,7 @@ CONFIG_DEFAULTS = {
     "api_key": "",
     "model": "",
     "read_media": True,
+    "video_sample": VIDEO_SAMPLE_DEFAULT,
     "thinking": THINKING_OFF,
     "temperature": 0.35,
     "max_length": MAX_LENGTH_DEFAULT,
@@ -153,6 +181,15 @@ def _log(message: str, *args: Any) -> None:
 
 class _Cancelled(Exception):
     """The editor asked for this generation to stop."""
+
+
+class _ThinkingOverflow(RuntimeError):
+    """The whole token budget went into a thought that never closed.
+
+    Separate from a plain failure because it is the one error a bigger budget
+    fixes: the describe pass retries the media with the thinking headroom
+    instead of dropping its description.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -193,6 +230,9 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
     if thinking not in THINKING_MODES:
         thinking = THINKING_OFF
     mmproj = str(source.get("gguf_mmproj") or GGUF_MMPROJ_AUTO).strip() or GGUF_MMPROJ_AUTO
+    video_sample = str(source.get("video_sample") or "").strip().lower()
+    if video_sample not in VIDEO_SAMPLES:
+        video_sample = VIDEO_SAMPLE_DEFAULT
     return {
         "version": CONFIG_VERSION,
         "api_format": api_format,
@@ -200,6 +240,7 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
         "api_key": str(source.get("api_key") or ""),
         "model": str(source.get("model") or "").strip(),
         "read_media": _as_bool(source.get("read_media"), True),
+        "video_sample": video_sample,
         "thinking": thinking,
         "temperature": round(temperature, 3),
         "max_length": integer("max_length", MAX_LENGTH_DEFAULT, MAX_LENGTH_MIN, MAX_LENGTH_LIMIT),
@@ -592,72 +633,243 @@ def _encode_pil(image, max_side: int = STILL_MAX_SIDE) -> bytes:
     return buffer.getvalue()
 
 
-def _video_still_parts(path: str, api_format: str, count: int = VIDEO_STILLS) -> list[dict[str, Any]]:
-    """Sample evenly spaced frames from a video file as image parts.
+def _video_sample_count(sample: str) -> int:
+    """How many stills one connected video becomes.
+
+    The setting is a plain frame budget; anything unrecognised falls back to the
+    default rather than to zero frames, because a video the model cannot see is
+    the one outcome worth avoiding.
+    """
+    value = str(sample or "").strip().lower()
+    if value not in VIDEO_SAMPLES:
+        value = VIDEO_SAMPLE_DEFAULT
+    match = re.match(r"(\d+)", value)
+    count = int(match.group(1)) if match else VIDEO_STILLS
+    return min(VIDEO_SAMPLE_MAX, max(VIDEO_SAMPLE_MIN, count))
+
+
+def _video_sample_times(duration: float, minimum: int = 2) -> list[float]:
+    """Candidate seek points across a clip of `duration` seconds.
+
+    One per second, first and last included. The last one is nudged just inside
+    the clip because seeking to the exact end lands past the final frame. A clip
+    too short to yield `minimum` candidates at that rate is sampled faster
+    instead: a 4 second video must still be able to fill a 12 frame budget.
+    """
+    if duration <= 0:
+        return []
+    end = max(0.0, duration - 0.05)
+    count = min(
+        VIDEO_SAMPLE_MAX_CANDIDATES,
+        max(2, minimum, int(duration * VIDEO_SAMPLE_RATE) + 1),
+    )
+    if end <= 0:
+        return [0.0]
+    step = end / float(count - 1)
+    return [step * index for index in range(count)]
+
+
+def _video_candidate_indices(total: int, fps: float, minimum: int = 2) -> list[int]:
+    """The same candidate set as `_video_sample_times`, by frame index.
+
+    Used where the frames are already decoded, so the clip is addressed by index
+    instead of by seek time.
+    """
+    if total <= 0:
+        return []
+    step = max(1, int(round(float(fps or 24.0) / VIDEO_SAMPLE_RATE)))
+    if minimum > 1:
+        step = max(1, min(step, total // max(1, minimum - 1)))
+    indices = list(range(0, total, step))
+    if indices[-1] != total - 1:
+        indices.append(total - 1)
+    limit = VIDEO_SAMPLE_MAX_CANDIDATES
+    if len(indices) > limit:
+        stride = len(indices) / float(limit)
+        thinned = [indices[min(len(indices) - 1, int(index * stride))] for index in range(limit)]
+        thinned[-1] = indices[-1]
+        indices = sorted(set(thinned))
+    return indices
+
+
+def _select_change_frames(scores: Sequence[float], count: int) -> list[int]:
+    """Choose `count` candidates: both ends, then wherever the picture moved.
+
+    A clip is judged by where it starts and where it ends, so those two are never
+    given up. What is left of the budget goes to the candidates that differ most
+    from the frame before them: that is where the cut, the gesture or the camera
+    move is, and it is what an evenly spaced sample keeps missing on a clip that
+    holds still and then does one thing.
+    """
+    total = len(scores)
+    if total <= count:
+        return list(range(total))
+    if count <= 1:
+        return [0] if total else []
+    chosen = {0, total - 1}
+    for index in sorted(range(1, total - 1), key=lambda position: (-scores[position], position)):
+        if len(chosen) >= count:
+            break
+        chosen.add(index)
+    return sorted(chosen)
+
+
+def _video_sample_detail(times: Sequence[float], duration: float = 0.0) -> str:
+    """Where in the clip the attached stills came from.
+
+    "In chronological order" was enough while the sampling was even. The change
+    based selection deliberately is not, so the timestamps have to be stated:
+    otherwise a held shot followed by a cut reads as four steady seconds, and the
+    model describes motion that is not there - or misses the speed of the motion
+    that is.
+    """
+    stamps = " / ".join(f"{float(value):.1f}s" for value in times if value is not None)
+    if not stamps:
+        return VIDEO_SAMPLE_ORDER
+    clip = f" of a {duration:.1f}s clip" if duration > 0 else ""
+    return (
+        f"at {stamps}{clip}. The spacing is uneven, so read the timestamps rather than "
+        "assuming a constant interval"
+    )
+
+
+def _still_change_scores(thumbnails: Sequence[Any]) -> list[float]:
+    """Mean absolute difference from the previous candidate, per candidate.
+
+    Pillow ships with ComfyUI and already holds the decoded frame, so the score
+    needs no extra dependency; the first candidate has nothing to compare against
+    and is forced in by `_select_change_frames` anyway.
+    """
+    scores = [0.0]
+    try:
+        from PIL import ImageChops, ImageStat
+    except ImportError:
+        return scores + [0.0] * max(0, len(thumbnails) - 1)
+    for previous, current in zip(thumbnails, thumbnails[1:]):
+        try:
+            scores.append(float(ImageStat.Stat(ImageChops.difference(previous, current)).mean[0]))
+        except Exception:
+            scores.append(0.0)
+    return scores
+
+
+def _video_still(frame, max_side: int = STILL_MAX_SIDE) -> tuple[bytes, Any] | None:
+    """One decoded frame as JPEG bytes plus the thumbnail its change is scored on.
+
+    Candidates are encoded as they are decoded rather than kept as images: at one
+    per second a long clip would otherwise hold a few hundred full-size bitmaps
+    in memory only to throw most of them away.
+    """
+    try:
+        image = frame.to_image().convert("RGB")
+        data = _encode_pil(image, max_side)
+        side = VIDEO_SAMPLE_SCORE_SIDE
+        thumbnail = image.convert("L").resize((side, side))
+    except Exception as exc:
+        logging.warning(LOG_PREFIX + "could not encode a sampled frame (%s).", exc)
+        return None
+    return data, thumbnail
+
+
+def _video_still_parts(
+    path: str,
+    api_format: str,
+    sample: str = VIDEO_SAMPLE_DEFAULT,
+    max_side: int = STILL_MAX_SIDE,
+) -> tuple[list[dict[str, Any]], list[float], float]:
+    """Sample a video file into the stills that stand in for it.
 
     A chat completion has no video channel, so this is the only way a connected
-    video reaches an OpenAI-compatible API or llama-cpp. Frames are seeked
-    rather than decoded in full, since a clip can be long and only a handful of
-    stills are wanted; files whose duration is unknown (or that refuse to seek)
-    fall back to a strided sequential decode.
+    video reaches an OpenAI-compatible API or llama-cpp. Candidates are taken at
+    one per second - seeked rather than decoded in full, since a clip can be
+    long - and the `sample` budget is then spent on the first frame, the last
+    frame and the biggest changes in between. Files whose duration is unknown (or
+    that refuse to seek) fall back to a strided sequential decode.
+
+    Returns the parts, the timestamp of each one and the clip's duration. The
+    times are part of the answer rather than a detail of it: the frames are
+    deliberately not evenly spaced, so a caller that cannot say where they came
+    from leaves the model guessing at everything between them.
     """
+    empty: tuple[list[dict[str, Any]], list[float], float] = ([], [], 0.0)
     if not path:
-        return []
+        return empty
     try:
         import av
     except ImportError:
         logging.warning(LOG_PREFIX + "PyAV is unavailable, so videos cannot be sampled.")
-        return []
-    frames: list[Any] = []
+        return empty
+    count = _video_sample_count(sample)
+    candidates: list[tuple[bytes, Any, float]] = []
+    duration = 0.0
     try:
         with av.open(path) as container:
             streams = container.streams.video
             if not streams:
-                return []
+                return empty
             stream = streams[0]
             stream.thread_type = "AUTO"
-            duration = 0.0
             if stream.duration and stream.time_base:
                 duration = float(stream.duration * stream.time_base)
             elif container.duration:
                 duration = float(container.duration) / float(av.time_base)
             if duration > 0 and stream.time_base:
-                for index in range(count):
-                    # Aim at the middle of each slice so the first and last
-                    # frames (often black) are not what gets described.
-                    seconds = duration * (index + 0.5) / count
+                for seconds in _video_sample_times(duration, count):
                     try:
-                        container.seek(int(seconds / stream.time_base), stream=stream)
-                        frame = next(container.decode(stream), None)
+                        # Seeking lands on the keyframe before the target, so the
+                        # decode is carried forward to the frame actually asked
+                        # for: a candidate set that silently collapses onto one
+                        # keyframe per GOP has no changes left to measure.
+                        target = int(seconds / stream.time_base)
+                        container.seek(target, stream=stream)
+                        frame = None
+                        for decoded in container.decode(stream):
+                            frame = decoded
+                            if decoded.pts is None or decoded.pts >= target:
+                                break
                     except Exception:
                         frame = None
-                    if frame is not None:
-                        frames.append(frame)
-            if not frames:
+                    if frame is None:
+                        continue
+                    still = _video_still(frame, max_side)
+                    if still is not None:
+                        # The frame's own timestamp rather than the one asked
+                        # for: the decode stops at the first frame at or past the
+                        # target, which is not exactly it.
+                        actual = float(frame.pts * stream.time_base) if frame.pts is not None else seconds
+                        candidates.append((still[0], still[1], actual))
+            if not candidates:
                 container.seek(0)
-                total = int(stream.frames or 0)
-                stride = max(1, total // count) if total else 1
+                rate = float(stream.average_rate or 0) or 24.0
+                stride = max(1, int(round(rate / VIDEO_SAMPLE_RATE)))
                 for index, frame in enumerate(container.decode(stream)):
-                    if index % stride == 0:
-                        frames.append(frame)
-                    if len(frames) >= count:
+                    if index % stride:
+                        continue
+                    still = _video_still(frame, max_side)
+                    if still is not None:
+                        candidates.append((still[0], still[1], index / rate))
+                    if len(candidates) >= VIDEO_SAMPLE_MAX_CANDIDATES:
                         break
     except Exception as exc:
         logging.warning(LOG_PREFIX + "could not sample %s (%s).", os.path.basename(path), exc)
-        return []
-    parts: list[dict[str, Any]] = []
-    for frame in frames:
-        try:
-            parts.append(_image_part(_encode_pil(frame.to_image()), "image/jpeg", api_format))
-        except Exception as exc:
-            logging.warning(LOG_PREFIX + "could not encode a sampled frame (%s).", exc)
+        return empty
+    if not candidates:
+        return empty
+    scores = _still_change_scores([thumbnail for _, thumbnail, _ in candidates])
+    chosen = _select_change_frames(scores, count)
+    parts = [_image_part(candidates[index][0], "image/jpeg", api_format) for index in chosen]
+    times = [candidates[index][2] for index in chosen]
     if parts:
-        _log("sampled %d frames from %s", len(parts), os.path.basename(path))
-    return parts
+        _log(
+            "sampled %d of %d candidate frames from %s (%s)",
+            len(parts), len(candidates), os.path.basename(path),
+            " / ".join(f"{value:.1f}s" for value in times),
+        )
+    return parts, times, duration
 
 
-def _tensor_still_parts(frames, api_format: str, count: int) -> list[dict[str, Any]]:
-    """Encode evenly spaced frames of an IMAGE/VIDEO tensor as image parts.
+def _tensor_parts(frames, indexes: Sequence[int], api_format: str) -> list[dict[str, Any]]:
+    """Encode the named frames of an IMAGE/VIDEO tensor as image parts.
 
     Used only during execution, where media arrives as tensors instead of the
     file paths the editor route reports.
@@ -667,13 +879,6 @@ def _tensor_still_parts(frames, api_format: str, count: int) -> list[dict[str, A
         from PIL import Image
     except ImportError:
         return []
-    try:
-        total = int(frames.shape[0])
-    except (AttributeError, IndexError, TypeError):
-        return []
-    if total <= 0:
-        return []
-    indexes = [min(total - 1, int(index * total / max(1, min(count, total)))) for index in range(min(count, total))]
     parts: list[dict[str, Any]] = []
     for index in indexes:
         try:
@@ -685,7 +890,94 @@ def _tensor_still_parts(frames, api_format: str, count: int) -> list[dict[str, A
     return parts
 
 
-def _media_items(resources: Sequence[Mapping[str, Any]], api_format: str) -> list[dict[str, Any]]:
+def _tensor_still_parts(frames, api_format: str, count: int) -> list[dict[str, Any]]:
+    """Encode evenly spaced frames of an IMAGE batch as image parts.
+
+    A batch is not a clip: its frames have no timeline to reason about, so they
+    are thinned evenly rather than by how much they changed.
+    """
+    try:
+        total = int(frames.shape[0])
+    except (AttributeError, IndexError, TypeError):
+        return []
+    if total <= 0:
+        return []
+    indexes = [min(total - 1, int(index * total / max(1, min(count, total)))) for index in range(min(count, total))]
+    return _tensor_parts(frames, indexes, api_format)
+
+
+def _tensor_change_scores(frames, indices: Sequence[int]) -> list[float]:
+    """Mean absolute difference between consecutive candidates of a frame batch.
+
+    The tensor is already in memory here, so the thumbnail is taken by striding
+    rather than by resizing.
+    """
+    try:
+        small = frames[list(indices)][..., :3].float()
+        step_h = max(1, int(small.shape[1]) // VIDEO_SAMPLE_SCORE_SIDE)
+        step_w = max(1, int(small.shape[2]) // VIDEO_SAMPLE_SCORE_SIDE)
+        small = small[:, ::step_h, ::step_w, :]
+        diff = (small[1:] - small[:-1]).abs().mean(dim=(1, 2, 3))
+        return [0.0] + [float(value) for value in diff]
+    except Exception:
+        return [0.0] * len(indices)
+
+
+def _sample_frames(frames, fps: float, limit: int) -> tuple[list[int], list[float]]:
+    """Choose `limit` frames of a decoded batch, the way the file path does.
+
+    Candidates at one per second, then the first frame, the last frame and the
+    biggest changes in between. Returns the indices and the second each of them
+    sits at, because that selection is not evenly spaced and the model is told so
+    in words.
+    """
+    rate = float(fps or 0) or 24.0
+    try:
+        count = int(frames.shape[0])
+    except (AttributeError, IndexError, TypeError):
+        return [], []
+    if count <= limit:
+        return list(range(count)), [index / rate for index in range(count)]
+    indices = _video_candidate_indices(count, rate, limit)
+    if len(indices) > limit:
+        chosen = _select_change_frames(_tensor_change_scores(frames, indices), limit)
+        indices = [indices[position] for position in chosen]
+    return indices, [index / rate for index in indices]
+
+
+def _tensor_video_parts(
+    frames,
+    fps: float,
+    api_format: str,
+    sample: str = VIDEO_SAMPLE_DEFAULT,
+) -> tuple[list[dict[str, Any]], list[float], float]:
+    """The execution path's `_video_still_parts`: a decoded clip as stills.
+
+    Same selection and the same timestamps as the file path, so an answer does
+    not depend on whether the video arrived as a filename or as a tensor.
+    """
+    rate = float(fps or 0) or 24.0
+    try:
+        total = int(frames.shape[0])
+    except (AttributeError, IndexError, TypeError):
+        return [], [], 0.0
+    if total <= 0:
+        return [], [], 0.0
+    indexes, times = _sample_frames(frames, rate, _video_sample_count(sample))
+    parts = _tensor_parts(frames, indexes, api_format)
+    if parts:
+        _log(
+            "sampled %d of %d decoded frames (%s)",
+            len(parts), total, " / ".join(f"{value:.1f}s" for value in times),
+        )
+    return parts, times[:len(parts)], total / rate
+
+
+def _media_items(
+    resources: Sequence[Mapping[str, Any]],
+    api_format: str,
+    sample: str = VIDEO_SAMPLE_DEFAULT,
+) -> list[dict[str, Any]]:
     """Resolve the editor's media list into taggable request parts.
 
     Every readable asset is kept, including the ones this format cannot carry:
@@ -711,7 +1003,10 @@ def _media_items(resources: Sequence[Mapping[str, Any]], api_format: str) -> lis
             # Connected but not a file on disk (a mid-graph tensor, an unknown
             # loader). Kept so the caller can report the skip instead of
             # letting the model answer about media it never received.
-            items.append({"tag": tag, "type": media_type, "path": "", "parts": [], "sampled": False})
+            items.append({
+                "tag": tag, "type": media_type, "path": "", "parts": [],
+                "sampled": False, "times": [], "duration": 0.0,
+            })
             continue
         try:
             # Only whole-file embedding is size-capped. The item survives either
@@ -724,10 +1019,15 @@ def _media_items(resources: Sequence[Mapping[str, Any]], api_format: str) -> lis
         except (OSError, ValueError):
             parts = []
         sampled = not parts and media_type == "video"
+        times: list[float] = []
+        duration = 0.0
         if sampled:
-            parts = _video_still_parts(path, api_format)
+            parts, times, duration = _video_still_parts(path, api_format, sample)
             sampled = bool(parts)
-        items.append({"tag": tag, "type": media_type, "path": path, "parts": parts, "sampled": sampled})
+        items.append({
+            "tag": tag, "type": media_type, "path": path, "parts": parts,
+            "sampled": sampled, "times": times, "duration": duration,
+        })
     return items
 
 
@@ -744,9 +1044,10 @@ def _media_manifest(items: Sequence[Mapping[str, Any]]) -> str:
         if not parts:
             continue
         if item.get("sampled"):
+            detail = _video_sample_detail(item.get("times") or [], float(item.get("duration") or 0.0))
             lines.append(
-                f"- {item['tag']}: {len(parts)} still frames sampled in chronological order from one "
-                "video clip. They are that single video, not separate images."
+                f"- {item['tag']}: {len(parts)} still frames from one video clip, sampled {detail}. "
+                "They are that single video, not separate images."
             )
         elif len(parts) > 1:
             lines.append(f"- {item['tag']}: {len(parts)} images from one batch")
@@ -802,7 +1103,7 @@ def _thinking_off_payload(api_format: str) -> dict[str, Any]:
     """
     if api_format == FORMAT_GEMINI:
         return {"generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}}
-    return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {"chat_template_kwargs": {"enable_thinking": False, "reasoning_effort": REASONING_EFFORT}}
 
 
 def _merge_payload(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
@@ -1416,7 +1717,7 @@ def _gguf_chat(
         # variable. llama-cpp only forwards this when it renders a Jinja
         # template, and ignores it otherwise, so sending both is the only way to
         # cover the whole family.
-        request["chat_template_kwargs"] = {"enable_thinking": False}
+        request["chat_template_kwargs"] = {"enable_thinking": False, "reasoning_effort": REASONING_EFFORT}
 
     def finish(raw: Any) -> str:
         text = _clean_output(raw, no_think)
@@ -1424,7 +1725,7 @@ def _gguf_chat(
             # Distinguishable from "the model said nothing": the block is there,
             # it simply never closed. Naming it is the difference between a
             # setting the user can raise and an unexplained empty answer.
-            raise ValueError(
+            raise _ThinkingOverflow(
                 f"The model spent all {int(max_tokens)} tokens reasoning and never reached an answer. "
                 "Raise Max answer tokens, or use a model whose thinking can be switched off."
             )
@@ -1471,6 +1772,13 @@ def _gguf_describe(
     started = time.perf_counter()
     _log("describing %d connected media with the GGUF, one at a time (max_tokens=%d)", len(describable), length)
     lines: list[str] = []
+    # The budget is raised for the rest of the run the first time a description
+    # is lost to an unterminated thought. The switches ask the model for no
+    # reasoning, but a vision chat handler renders no Jinja template, so neither
+    # `enable_thinking` nor `reasoning_effort` reaches it there and the budget is
+    # all that is left. Paying for one discarded thought beats losing every
+    # description.
+    budget = length
     try:
         for index, item in enumerate(describable, start=1):
             if should_stop is not None and should_stop():
@@ -1480,7 +1788,10 @@ def _gguf_describe(
             parts = list(item.get("parts") or [])
             # llama-cpp has no video channel, so a clip arrives as ordered stills.
             request = (
-                VIDEO_STILLS_REQUEST.format(count=len(parts))
+                VIDEO_STILLS_REQUEST.format(
+                    count=len(parts),
+                    detail=_video_sample_detail(item.get("times") or [], float(item.get("duration") or 0.0)),
+                )
                 if item.get("sampled") else DESCRIBE_REQUESTS[media_type]
             )
             if not parts:
@@ -1493,9 +1804,28 @@ def _gguf_describe(
             )
             step = time.perf_counter()
             try:
-                description = _gguf_chat(llm, DESCRIBE_SYSTEM, request, parts, length, temperature, gemma, should_stop)
+                description = _gguf_chat(llm, DESCRIBE_SYSTEM, request, parts, budget, temperature, gemma, should_stop)
             except _Cancelled:
                 raise
+            except _ThinkingOverflow as exc:
+                headroom = length + DESCRIBE_THINKING_HEADROOM
+                if budget >= headroom:
+                    logging.warning(LOG_PREFIX + "could not describe %s (%s).", label, exc)
+                    continue
+                budget = headroom
+                _log(
+                    "  %s (%d/%d): the model kept thinking; retrying it and the rest with max_tokens=%d",
+                    label, index, len(describable), budget,
+                )
+                try:
+                    description = _gguf_chat(
+                        llm, DESCRIBE_SYSTEM, request, parts, budget, temperature, gemma, should_stop,
+                    )
+                except _Cancelled:
+                    raise
+                except Exception as retry_exc:
+                    logging.warning(LOG_PREFIX + "could not describe %s (%s).", label, retry_exc)
+                    continue
             except Exception as exc:
                 logging.warning(LOG_PREFIX + "could not describe %s (%s).", label, exc)
                 continue
@@ -1763,7 +2093,12 @@ def _register_routes() -> bool:
             # chat-completions format, so the media builder is shared.
             parts_format = FORMAT_OPENAI if api_format == FORMAT_GGUF else api_format
             resources = payload.get("resources") if isinstance(payload.get("resources"), list) else []
-            items = await asyncio.to_thread(_media_items, resources, parts_format) if _as_bool(settings.get("read_media"), True) else []
+            items = (
+                await asyncio.to_thread(
+                    _media_items, resources, parts_format, str(settings.get("video_sample") or ""),
+                )
+                if _as_bool(settings.get("read_media"), True) else []
+            )
             # The GGUF loop polls this, so cancelling actually stops the
             # generation instead of only freeing the editor.
             should_stop = (lambda: _is_cancelled(request_id)) if request_id else None
@@ -1826,20 +2161,39 @@ def _register_routes_when_ready() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _execution_media_items(image, video, api_format: str) -> list[dict[str, Any]]:
+def _execution_media_items(
+    image,
+    video,
+    api_format: str,
+    sample: str = VIDEO_SAMPLE_DEFAULT,
+) -> list[dict[str, Any]]:
     """Build request parts from the tensors an execution actually receives."""
     items: list[dict[str, Any]] = []
     if image is not None:
         parts = _tensor_still_parts(image, api_format, IMAGE_BATCH_STILLS)
-        items.append({"tag": "image 1", "type": "image", "path": "", "parts": parts, "sampled": len(parts) > 1})
+        items.append({
+            "tag": "image 1", "type": "image", "path": "", "parts": parts,
+            "sampled": len(parts) > 1, "times": [], "duration": 0.0,
+        })
     if video is not None:
         frames = None
+        rate = 0.0
         try:
-            frames = video.get_components().images
+            components = video.get_components()
+            frames = components.images
+            # A clip with no declared rate is read at 24 fps, the same fallback
+            # the file path uses: the timestamps are then approximate, but the
+            # selection still lands on the frames that changed.
+            rate = float(getattr(components, "frame_rate", 0) or 0)
         except Exception as exc:
             logging.warning(LOG_PREFIX + "could not read the connected video (%s).", exc)
-        parts = _tensor_still_parts(frames, api_format, VIDEO_STILLS) if frames is not None else []
-        items.append({"tag": "video 1", "type": "video", "path": "", "parts": parts, "sampled": bool(parts)})
+        parts, times, duration = (
+            _tensor_video_parts(frames, rate, api_format, sample) if frames is not None else ([], [], 0.0)
+        )
+        items.append({
+            "tag": "video 1", "type": "video", "path": "", "parts": parts,
+            "sampled": bool(parts), "times": times, "duration": duration,
+        })
     return items
 
 
@@ -1911,7 +2265,7 @@ class LLMWidget:
         api_format = str(settings.get("api_format") or FORMAT_OPENAI).lower()
         parts_format = FORMAT_OPENAI if api_format == FORMAT_GGUF else api_format
         items = (
-            _execution_media_items(image, video, parts_format)
+            _execution_media_items(image, video, parts_format, str(settings.get("video_sample") or ""))
             if _as_bool(settings.get("read_media"), True) else []
         )
         text = _generate(settings, str(system_prompt or ""), str(question), items, None, stored)
