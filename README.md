@@ -40,13 +40,12 @@ handler がなくても動きますが、その場合はテキストだけを見
 `tools/install_helper.py` が必要なコマンドを組み立ててくれます。CUDA のバージョンを検出し、
 PyTorch のインデックスと上記リポジトリのリリース資産を確認したうえで、指定した環境に対する
 `pip install` の行をそのまま出力します。すでに最新であればその旨を表示します。
-`--run` を付けない限り、インストールは一切行いません。
 
 ```bat
 python tools\install_helper.py --python "C:\AI\ComfyUI\python_embeded\python.exe"
 ```
 
-主なフラグは `--cuda cu130`（検出をスキップ。CPU ビルドなら `cpu`）、`--run`、`--force`
+主なフラグは `--cuda cu130`（検出をスキップ。CPU ビルドなら `cpu`）、`--force`
 （最新でもコマンドを出力する）、`--no-torch` / `--no-llama`。`--python` を指定すれば対象環境を
 アクティベートしておく必要はありません。このフラグを省くのは対象環境が既にアクティブなときだけに
 してください。そうでないと `PATH` の先頭にある Python について報告することになります。
@@ -351,13 +350,12 @@ one the model still answers, from the text alone.
 `tools/install_helper.py` works out the command for you. It detects the CUDA version, checks
 the PyTorch index and the release assets of that repository, and prints the exact
 `pip install` line for the environment you point it at — or tells you it is already current.
-It installs nothing unless you pass `--run`.
 
 ```bat
 python tools\install_helper.py --python "C:\AI\ComfyUI\python_embeded\python.exe"
 ```
 
-Useful flags: `--cuda cu130` (skip detection, `cpu` for CPU builds), `--run`, `--force`
+Useful flags: `--cuda cu130` (skip detection, `cpu` for CPU builds), `--force`
 (re-emit a command even when current), `--no-torch` / `--no-llama`. With `--python` the
 target environment does not have to be activated; drop the flag only when it already is,
 or you will be reporting on whichever Python is first on your `PATH`.
