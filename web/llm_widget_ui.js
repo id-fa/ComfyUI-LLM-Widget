@@ -8,8 +8,10 @@ import { api } from "../../scripts/api.js";
  * purpose: they already handle IME composition, resizing and undo, which a
  * hand-rolled contenteditable would have to reimplement. This file only adds
  * the pieces ComfyUI has no widget for — a run/stop button that talks to the
- * editor-time HTTP route, a settings dialog, and the link tracing that turns a
- * connected IMAGE/VIDEO socket into a file the server can read.
+ * editor-time HTTP route, a settings dialog, the link tracing that turns a
+ * connected IMAGE/VIDEO socket into a file the server can read, and a tab strip
+ * that keeps several system prompts on the node and swaps them through the
+ * native `system_prompt` field.
  */
 
 const NODE_NAME = "LLMWidget";
@@ -56,6 +58,19 @@ const GGUF_MMPROJ_NONE = "none";
 const GGUF_CONTEXT_DEFAULT = 16384;
 const GGUF_CONTEXT_MIN = 512;
 const GGUF_CONTEXT_LIMIT = 1048576;
+
+// The system prompt tabs live in the node's properties, not in a widget, so the
+// widget list the server declares stays exactly what it was. Only the open
+// tab's text is ever in the `system_prompt` widget, and only that is sent.
+const SYSTEM_TABS_PROP = "llmw_system_tabs";
+const SYSTEM_TAB_INDEX_PROP = "llmw_system_tab_index";
+const SYSTEM_TABS_HEIGHT = 22;
+const SYSTEM_TAB_LABEL_LIMIT = 24;
+const SYSTEM_TAB_LIMIT = 20;
+// INPUT_TYPES order in nodes.py. `widgets_values` is written and read back in
+// this order by name, because the tab strip sits in front of `system_prompt`
+// and frontends disagree on whether a non-serialized widget holds an index.
+const SAVED_WIDGETS = ["system_prompt", "generate_on_execute", "answer", "question"];
 
 const MEDIA_INPUTS = [
     { name: "image", type: "image", icon: "▣" },
@@ -165,6 +180,13 @@ const TEXT = {
         + "without one the model answers from text alone.",
     httpHint: "Any OpenAI-compatible /v1/chat/completions endpoint. The path is completed automatically.",
     geminiHint: "Google's native generateContent endpoint. Videos are sent whole instead of as sampled frames.",
+    tabPrefix: "Prompt",
+    tabAdd: "New system prompt tab",
+    tabRemove: "Delete tab",
+    tabRemoveConfirm: "Delete this tab and its system prompt?",
+    tabMoveLeft: "Move left",
+    tabMoveRight: "Move right",
+    tabRenameHint: "Double-click to rename",
     mediaNoFile: "not a saved file - it will be skipped",
     mediaSkipped: "Could not read: ",
 };
@@ -875,6 +897,373 @@ async function openSettings() {
 }
 
 // --------------------------------------------------------------------------- //
+// System prompt tabs
+// --------------------------------------------------------------------------- //
+
+function defaultTabLabel(index) {
+    return `${TEXT.tabPrefix} ${Math.max(1, Number(index) + 1)}`;
+}
+
+function normalizeTab(entry, index) {
+    const source = entry && typeof entry === "object" ? entry : {};
+    const label = String(source.label || "").trim().slice(0, SYSTEM_TAB_LABEL_LIMIT);
+    return {
+        label: label || defaultTabLabel(index),
+        text: typeof source.text === "string" ? source.text : "",
+    };
+}
+
+/**
+ * The node's system prompts. A node that has none yet — a new one, or a
+ * workflow saved before the tabs existed — gets a first tab holding whatever
+ * the `system_prompt` field has in it, so nothing is lost.
+ */
+function systemTabs(node) {
+    if (!node) return [];
+    node.properties ||= {};
+    let tabs = node.properties[SYSTEM_TABS_PROP];
+    if (!Array.isArray(tabs) || !tabs.length) {
+        tabs = [normalizeTab({ text: widgetText(node, "system_prompt") }, 0)];
+        node.properties[SYSTEM_TABS_PROP] = tabs;
+    }
+    return tabs;
+}
+
+function activeSystemTabIndex(node) {
+    const tabs = systemTabs(node);
+    const index = Number(node?.properties?.[SYSTEM_TAB_INDEX_PROP]);
+    if (!Number.isFinite(index)) return 0;
+    return Math.min(tabs.length - 1, Math.max(0, Math.floor(index)));
+}
+
+function setActiveSystemTabIndex(node, index) {
+    const tabs = systemTabs(node);
+    node.properties[SYSTEM_TAB_INDEX_PROP] = Math.min(tabs.length - 1, Math.max(0, Math.floor(Number(index) || 0)));
+}
+
+/**
+ * Copy the `system_prompt` field into the open tab.
+ *
+ * The field is the authority for the open tab, not the other way round: it is
+ * the native textarea the user types into, it is what the server receives, and
+ * it is what a workflow edited with this extension disabled would have changed.
+ * So nothing listens to keystrokes — the tab is brought up to date right before
+ * anything that reads it: a tab operation, a save, a load.
+ */
+function flushSystemTab(node) {
+    if (!getWidget(node, "system_prompt")) return;
+    const tab = systemTabs(node)[activeSystemTabIndex(node)];
+    if (tab) tab.text = widgetText(node, "system_prompt");
+}
+
+function loadSystemTab(node) {
+    const tab = systemTabs(node)[activeSystemTabIndex(node)];
+    setWidgetText(node, "system_prompt", tab?.text ?? "");
+    syncSystemTabStrip(node);
+}
+
+function switchSystemTab(node, index) {
+    const next = Math.min(systemTabs(node).length - 1, Math.max(0, Number(index) || 0));
+    if (next === activeSystemTabIndex(node)) return;
+    flushSystemTab(node);
+    setActiveSystemTabIndex(node, next);
+    loadSystemTab(node);
+}
+
+function addSystemTab(node) {
+    const tabs = systemTabs(node);
+    if (tabs.length >= SYSTEM_TAB_LIMIT) return;
+    flushSystemTab(node);
+    tabs.push(normalizeTab({}, tabs.length));
+    setActiveSystemTabIndex(node, tabs.length - 1);
+    loadSystemTab(node);
+    widgetField(node, "system_prompt")?.focus?.({ preventScroll: true });
+}
+
+function removeSystemTab(node, index) {
+    const tabs = systemTabs(node);
+    // The node always keeps one tab, so the last one has no × at all.
+    if (tabs.length <= 1 || !tabs[index]) return;
+    flushSystemTab(node);
+    const tab = tabs[index];
+    const ask = globalThis.confirm;
+    if (tab.text.trim() && typeof ask === "function"
+        && !ask.call(globalThis, `${TEXT.tabRemoveConfirm}\n\n${tab.label}`)) return;
+    const previous = activeSystemTabIndex(node);
+    tabs.splice(index, 1);
+    setActiveSystemTabIndex(node, previous > index ? previous - 1 : Math.min(previous, tabs.length - 1));
+    loadSystemTab(node);
+}
+
+/** Only the open tab has arrows, so the moved tab is always the open one. */
+function moveSystemTab(node, index, offset) {
+    const tabs = systemTabs(node);
+    const target = index + offset;
+    if (!tabs[index] || target < 0 || target >= tabs.length) return;
+    flushSystemTab(node);
+    const [tab] = tabs.splice(index, 1);
+    tabs.splice(target, 0, tab);
+    setActiveSystemTabIndex(node, target);
+    syncSystemTabStrip(node);
+    node.setDirtyCanvas?.(true, true);
+    app.graph?.change?.();
+}
+
+function makeTabAction(className, label, text, onClick) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = className;
+    button.textContent = text;
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    button.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+    });
+    button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onClick();
+    });
+    return button;
+}
+
+function beginSystemTabRename(node, index, labelElement) {
+    const tab = systemTabs(node)[index];
+    if (!tab || labelElement.querySelector("input")) return;
+    const input = document.createElement("input");
+    input.className = "llmw-tab-rename";
+    input.value = tab.label;
+    input.maxLength = SYSTEM_TAB_LABEL_LIMIT;
+    input.spellcheck = false;
+    let done = false;
+    const commit = (save) => {
+        // Removing the input blurs it, and the blur would commit a second time.
+        if (done) return;
+        done = true;
+        node.__llmwTabCommit = null;
+        if (save) {
+            tab.label = input.value.trim().slice(0, SYSTEM_TAB_LABEL_LIMIT) || defaultTabLabel(index);
+            app.graph?.change?.();
+        }
+        syncSystemTabStrip(node);
+    };
+    // A rebuild of the strip takes the input with it, and not every browser
+    // blurs an element on removal — so the rebuild commits the rename itself.
+    node.__llmwTabCommit = () => commit(true);
+    input.addEventListener("pointerdown", (event) => event.stopPropagation());
+    input.addEventListener("keydown", (event) => {
+        event.stopPropagation();
+        // Enter also confirms an IME conversion, which is not the end of the name.
+        if (event.isComposing) return;
+        if (event.key === "Enter") commit(true);
+        else if (event.key === "Escape") commit(false);
+    });
+    input.addEventListener("blur", () => commit(true));
+    labelElement.textContent = "";
+    labelElement.append(input);
+    input.focus();
+    input.select();
+}
+
+function syncSystemTabStrip(node) {
+    const strip = node?.__llmwTabStrip;
+    if (!strip) return;
+    node.__llmwTabCommit?.();
+    const tabs = systemTabs(node);
+    const active = activeSystemTabIndex(node);
+    strip.textContent = "";
+    tabs.forEach((tab, index) => {
+        const isActive = index === active;
+        const item = document.createElement("div");
+        item.className = `llmw-tab${isActive ? " is-active" : ""}`;
+        item.setAttribute("role", "tab");
+        item.setAttribute("aria-selected", isActive ? "true" : "false");
+        item.title = isActive ? TEXT.tabRenameHint : tab.label;
+        const label = document.createElement("span");
+        label.className = "llmw-tab-label";
+        label.textContent = tab.label;
+        item.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            switchSystemTab(node, index);
+        });
+        item.addEventListener("dblclick", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            // The first click of the pair already opened the tab and rebuilt the
+            // strip, so the rename goes to whatever label stands there now.
+            const current = node.__llmwTabStrip?.children?.[index]?.querySelector?.(".llmw-tab-label");
+            if (current) beginSystemTabRename(node, index, current);
+        });
+        if (isActive && index > 0) {
+            item.append(makeTabAction("llmw-tab-action", TEXT.tabMoveLeft, "◀", () => moveSystemTab(node, index, -1)));
+        }
+        item.append(label);
+        if (isActive && index < tabs.length - 1) {
+            item.append(makeTabAction("llmw-tab-action", TEXT.tabMoveRight, "▶", () => moveSystemTab(node, index, 1)));
+        }
+        if (tabs.length > 1) {
+            item.append(makeTabAction("llmw-tab-action is-close", TEXT.tabRemove, "×", () => removeSystemTab(node, index)));
+        }
+        strip.append(item);
+    });
+    const add = makeTabAction("llmw-tab-add", TEXT.tabAdd, "+", () => addSystemTab(node));
+    add.disabled = tabs.length >= SYSTEM_TAB_LIMIT;
+    strip.append(add);
+}
+
+function installTabStrip(node) {
+    if (typeof document === "undefined" || typeof node.addDOMWidget !== "function") return;
+    if (!getWidget(node, "system_prompt")) return;
+
+    const strip = document.createElement("div");
+    strip.className = "llmw-tabs";
+    strip.setAttribute("role", "tablist");
+    strip.addEventListener("pointerdown", (event) => event.stopPropagation());
+    strip.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        // A row that overflows scrolls sideways; one that fits zooms the canvas
+        // like the rest of the node does.
+        if (strip.scrollWidth > strip.clientWidth) strip.scrollLeft += event.deltaY || event.deltaX;
+        else app.canvas?.processMouseWheel?.(event);
+    }, { passive: false });
+
+    const widget = node.addDOMWidget("llmw_tabs", "llmw_tabs", strip, {
+        serialize: false,
+        margin: 4,
+        getMinHeight: () => SYSTEM_TABS_HEIGHT,
+        getMaxHeight: () => SYSTEM_TABS_HEIGHT,
+        getValue: () => "",
+        setValue: () => {},
+    });
+    if (!widget) {
+        strip.remove();
+        return;
+    }
+    widget.serialize = false;
+    // Directly above the field it switches. This is the one place the widget
+    // list is reordered, and saveNodeWidgets / restoreNodeWidgets exist so that
+    // `widgets_values` never notices.
+    const widgets = node.widgets;
+    widgets.splice(widgets.indexOf(widget), 1);
+    widgets.splice(Math.max(0, widgets.indexOf(getWidget(node, "system_prompt"))), 0, widget);
+    node.__llmwTabStrip = strip;
+    syncSystemTabStrip(node);
+}
+
+/**
+ * onSerialize: bring the open tab up to date and write `widgets_values` the way
+ * a node without the tab strip would — the four declared widgets, in
+ * INPUT_TYPES order, no slot for the strip. LiteGraph has already cloned the
+ * properties into `data` by now, so the tabs are written there as well.
+ */
+function saveNodeWidgets(node, data) {
+    if (!node.__llmwTabStrip || !data) return;
+    flushSystemTab(node);
+    data.properties ||= {};
+    data.properties[SYSTEM_TABS_PROP] = systemTabs(node).map((tab) => ({ ...tab }));
+    data.properties[SYSTEM_TAB_INDEX_PROP] = activeSystemTabIndex(node);
+    data.widgets_values = SAVED_WIDGETS.map((name) => getWidget(node, name)?.value ?? null);
+}
+
+/**
+ * onConfigure: the counterpart. Whatever index rule this frontend applied to
+ * the strip, the declared widgets are assigned again by name, and then the
+ * loaded `system_prompt` becomes the open tab's text.
+ */
+function restoreNodeWidgets(node, info) {
+    if (!node.__llmwTabStrip) return;
+    const values = info?.widgets_values;
+    if (Array.isArray(values)) {
+        SAVED_WIDGETS.forEach((name, index) => {
+            const widget = getWidget(node, name);
+            if (widget && index < values.length && values[index] != null) widget.value = values[index];
+        });
+    }
+    const saved = node.properties?.[SYSTEM_TABS_PROP];
+    if (Array.isArray(saved) && saved.length) {
+        node.properties[SYSTEM_TABS_PROP] = saved.slice(0, SYSTEM_TAB_LIMIT).map(normalizeTab);
+    }
+    flushSystemTab(node);
+    syncSystemTabStrip(node);
+}
+
+// --------------------------------------------------------------------------- //
+// Nodes 2.0 row sizing
+// --------------------------------------------------------------------------- //
+
+/**
+ * Keep the tab strip and the toolbar at their own height in the Vue renderer.
+ *
+ * There the node body is a CSS grid whose default `align-content: stretch`
+ * hands every `auto` row a share of the node's spare height, so the strip and
+ * the toolbar grow along with the three text fields. Rows without a textarea
+ * are pinned to `min-content` and the text fields stay `auto` — not a pixel
+ * height, which would raise the node's minimum and make it un-shrinkable.
+ *
+ * The classic renderer has no `.lg-node` element, so every lookup misses and
+ * this does nothing there.
+ */
+function applyRowSizing(node) {
+    // A removed node has no graph, and a late frame must not latch it onto the
+    // element of whatever node a reloaded workflow gave the same id.
+    if (typeof document === "undefined" || !node?.graph || node.id == null) return;
+    const root = document.querySelector(`.lg-node[data-node-id="${node.id}"]`);
+    const grid = root?.querySelector(".lg-node-widgets");
+    if (!grid) return;
+    const rows = [...grid.children];
+    if (!rows.some((row) => row.querySelector("textarea"))) return; // not mounted yet
+    const wanted = rows.map((row) => (row.querySelector("textarea") ? "auto" : "min-content")).join(" ");
+    if (grid.style.gridTemplateRows !== wanted) grid.style.gridTemplateRows = wanted;
+    if (typeof MutationObserver !== "function") return;
+
+    // The frontend rewrites the inline `grid-template-rows` on its own layout
+    // passes. Writing ours back fires this observer once more, but by then the
+    // value already matches and nothing is written, so it does not loop.
+    if (node.__llmwRowGrid !== grid) {
+        node.__llmwRowObserver?.disconnect();
+        node.__llmwRowObserver = new MutationObserver(() => applyRowSizing(node));
+        node.__llmwRowObserver.observe(grid, { attributes: true, attributeFilter: ["style"] });
+        node.__llmwRowGrid = grid;
+    }
+    // A remount replaces the whole grid and strands the observer above on the
+    // detached one, so the node root is watched for structural changes too.
+    // `childList` only: typing and style churn do not fire it.
+    if (node.__llmwRowRoot !== root) {
+        node.__llmwRootObserver?.disconnect();
+        node.__llmwRootObserver = new MutationObserver(() => scheduleRowSizing(node));
+        node.__llmwRootObserver.observe(root, { childList: true, subtree: true });
+        node.__llmwRowRoot = root;
+    }
+}
+
+/** After the frame in which Vue re-renders the node, not in the middle of it. */
+function scheduleRowSizing(node) {
+    if (!node || node.__llmwRowScheduled) return;
+    if (typeof requestAnimationFrame !== "function") {
+        applyRowSizing(node);
+        return;
+    }
+    node.__llmwRowScheduled = true;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+        node.__llmwRowScheduled = false;
+        applyRowSizing(node);
+    }));
+}
+
+/** Observers pin the node and its detached DOM, so a removed node lets go of them. */
+function releaseRowSizing(node) {
+    node.__llmwRowObserver?.disconnect();
+    node.__llmwRootObserver?.disconnect();
+    node.__llmwRowObserver = null;
+    node.__llmwRootObserver = null;
+    node.__llmwRowGrid = null;
+    node.__llmwRowRoot = null;
+}
+
+// --------------------------------------------------------------------------- //
 // Toolbar
 // --------------------------------------------------------------------------- //
 
@@ -938,6 +1327,7 @@ function syncNode(node) {
         unloadButton.setAttribute("aria-label", unloadButton.title);
     }
     syncMediaLine(node);
+    scheduleRowSizing(node);
 }
 
 function syncAllNodes() {
@@ -1213,9 +1603,27 @@ function installNode(nodeType, nodeData) {
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
         const result = onNodeCreated?.apply(this, arguments);
+        // Before the toolbar, which has to be the last widget added.
+        installTabStrip(this);
         installToolbar(this);
         loadSettings().catch(() => {});
         if (this.size?.[0] < 380) this.setSize?.([380, this.size[1]]);
+        // The Vue-rendered element can land a little after the node exists.
+        for (const delay of [100, 500]) setTimeout(() => applyRowSizing(this), delay);
+        return result;
+    };
+
+    const onSerialize = nodeType.prototype.onSerialize;
+    nodeType.prototype.onSerialize = function (data) {
+        const result = onSerialize?.apply(this, arguments);
+        saveNodeWidgets(this, data);
+        return result;
+    };
+
+    const onConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function (info) {
+        const result = onConfigure?.apply(this, arguments);
+        restoreNodeWidgets(this, info);
         return result;
     };
 
@@ -1241,6 +1649,8 @@ function installNode(nodeType, nodeData) {
     const onRemoved = nodeType.prototype.onRemoved;
     nodeType.prototype.onRemoved = function () {
         clearStatusTimer(this);
+        this.__llmwTabCommit = null;
+        releaseRowSizing(this);
         if (this.__llmwPending) cancelGeneration(this);
         return onRemoved?.apply(this, arguments);
     };
@@ -1275,6 +1685,35 @@ function installStyle() {
         border-radius: 999px; background: rgba(255,255,255,.04); color: rgba(227,227,227,.6); font-size: 10px; line-height: 16px;
       }
       .llmw-chip.is-missing { border-color: rgba(242,139,130,.35); color: rgba(242,139,130,.85); text-decoration: line-through; }
+      .llmw-tabs {
+        display: flex; align-items: stretch; gap: 4px; width: 100%; height: ${SYSTEM_TABS_HEIGHT}px; box-sizing: border-box;
+        overflow-x: auto; overflow-y: hidden; scrollbar-width: none; user-select: none;
+        font-family: "Google Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+      }
+      .llmw-tabs::-webkit-scrollbar { display: none; }
+      .llmw-tab, .llmw-tab-add {
+        appearance: none; display: inline-flex; align-items: center; gap: 3px; flex: 0 0 auto; max-width: 170px; box-sizing: border-box;
+        padding: 0 4px 0 8px; border: 1px solid rgba(255,255,255,.12); border-radius: 6px; background: rgba(255,255,255,.03);
+        color: rgba(227,227,227,.5); cursor: pointer; font: inherit; font-size: 11px; line-height: 1; white-space: nowrap;
+        transition: background .18s, border-color .18s, color .18s;
+      }
+      .llmw-tab:hover { background: rgba(255,255,255,.07); color: rgba(227,227,227,.82); }
+      .llmw-tab.is-active { border-color: rgba(168,199,250,.38); background: rgba(168,199,250,.12); color: #dce7fa; }
+      .llmw-tab-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+      .llmw-tab-rename {
+        width: 96px; height: 16px; box-sizing: border-box; margin: 0; padding: 0 4px; border: 1px solid rgba(168,199,250,.45); border-radius: 4px;
+        outline: none; background: #1a1b1e; color: #e3e3e3; font: inherit; font-size: 11px;
+      }
+      .llmw-tab-action {
+        appearance: none; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 14px; height: 14px;
+        padding: 0; border: 0; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; font: inherit; font-size: 8px;
+        line-height: 1; opacity: .7;
+      }
+      .llmw-tab-action:hover { background: rgba(255,255,255,.14); opacity: 1; }
+      .llmw-tab-action.is-close { font-size: 13px; }
+      .llmw-tab-add { justify-content: center; width: 24px; padding: 0; color: rgba(168,199,250,.8); font-size: 14px; }
+      .llmw-tab-add:hover:not(:disabled) { border-color: rgba(168,199,250,.42); background: rgba(168,199,250,.14); color: #dce7fa; }
+      .llmw-tab-add:disabled { cursor: not-allowed; opacity: .3; }
       /* The answer field in continue mode. Only the face changes: it is still
          ComfyUI's own textarea, with its IME handling, resizing and undo. */
       textarea.llmw-log { font-family: ui-monospace, "Cascadia Mono", Consolas, "Noto Sans Mono", monospace; line-height: 1.45; }

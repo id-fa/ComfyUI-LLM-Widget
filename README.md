@@ -87,7 +87,11 @@ C:\AI\ComfyUI\python_embeded\python.exe -c "from llama_cpp.llama_chat_format imp
   表示）、⧉ 答えをコピー、⌫ 会話を消去（continue モードのときだけ表示）、⚙ 設定。その上には、
   接続したメディアごとに実際に送られるものを示すチップが並びます。
 - **system_prompt** — 自由記述。ワークフローと一緒に保存されます。「テンプレート」と呼べるものは
-  これだけです。
+  これだけです。すぐ上のタブで複数のシステムプロンプトを保存しておき、切り替えて使えます:
+  クリックで切り替え、ダブルクリックで名前変更、`+` で追加、`×` で削除、開いているタブの
+  `◀` `▶` で並べ替え。送られるのは開いているタブだけです。タブはノードごとにワークフローへ
+  保存され、`system_prompt` の値は常に開いているタブの内容なので、実行時（API 実行を含む）も
+  そのまま使われます。
 - **generate_on_execute** — 既定はオフ。下記参照。
 - **answer** — 答えが入る場所。編集可能で、ワークフローと一緒に保存されます。continue モードでは
   ここが会話ログそのものになります（*会話を続ける* を参照）。
@@ -397,7 +401,10 @@ Widgets:
   (shown in continue mode only), ⚙ settings. Above it, a chip per connected media shows what
   will actually be sent.
 - **system_prompt** — free text, saved with the workflow. This is the only "template"
-  there is.
+  there is. The tabs right above it keep several system prompts on the node: click to switch,
+  double-click to rename, `+` to add, `×` to delete, `◀` `▶` on the open tab to reorder. Only
+  the open tab is sent. The tabs are saved per node with the workflow, and the `system_prompt`
+  value is always the open tab's text, so an execution (API runs included) uses it as is.
 - **generate_on_execute** — off by default, see below.
 - **answer** — where the result lands. Editable; saved with the workflow. In continue mode this
   is the conversation log itself, see *Continuing the conversation*.

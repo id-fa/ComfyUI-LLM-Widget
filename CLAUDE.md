@@ -213,7 +213,8 @@ code. This is a deliberate divergence from the MiniMax H3 optimizer, which alway
 
 `system_prompt`, `answer` and `question` are ordinary ComfyUI multiline `STRING` widgets. They are
 **not** replaced by DOM widgets: the native textarea already handles IME composition (this pack's
-author writes Japanese), resizing and undo. The only DOM widget is the toolbar, which is added last
+author writes Japanese), resizing and undo. The DOM widgets are the system prompt tab strip (see
+below) and the toolbar, which is added last
 and stays last, so the run and copy buttons sit in the node's bottom-right corner where the eye
 already is after typing. Inside the row the status label stretches and the buttons are
 right-aligned, with an empty button's width (`.llmw-gap`) held open in front of ✦ so a misaimed
@@ -233,7 +234,51 @@ the frontend has the same defect plus a frontend-version one.
 the callback, because which of those a multiline widget actually reads differs across ComfyUI
 frontend versions.
 
+## System prompt tabs
+
+Ported from `ComfyUI-PromptPalette-F`'s Prompt Tabs by way of the MiniMax H3 Easy port, and
+frontend-only — `nodes.py` knows nothing about it:
+
+```
+node.properties["llmw_system_tabs"]      = [{ label, text }, …]
+node.properties["llmw_system_tab_index"] = open tab
+```
+
+- **The `system_prompt` widget is the editor of the open tab and the authority for its text.** It
+  is what the route and `run` receive, so only the open tab is ever sent, and a workflow works the
+  same with the extension disabled. Nothing listens to keystrokes: `flushSystemTab` copies the
+  widget into the open tab right before anything reads the tabs (a tab operation, `onSerialize`,
+  `onConfigure`). On load the widget wins over the stored tab text for the same reason.
+- It is `node.properties` and not a hidden `tabs_data` widget (PromptPalette's shape) because a
+  widget would be one more index in `widgets_values`.
+- `systemTabs()` is the only accessor and migrates on first touch: a node with no tabs gets one
+  holding whatever `system_prompt` has.
+- **The strip is the one widget spliced out of creation order** — it has to sit above
+  `system_prompt`, i.e. at index 0 — and frontends disagree on whether a `serialize = false`
+  widget holds an index in `widgets_values` (LiteGraph wrote holes and read by index; newer
+  frontends skip it on one side or both). So `saveNodeWidgets` (`onSerialize`) rewrites
+  `widgets_values` as the four `SAVED_WIDGETS` in `INPUT_TYPES` order, exactly what a strip-less
+  node writes, and `restoreNodeWidgets` (`onConfigure`) reassigns them by name. `SAVED_WIDGETS`
+  must follow `INPUT_TYPES`. `onSerialize` runs *after* LiteGraph cloned the properties, which is
+  why the tabs are written into `data.properties` too.
+- The strip is one fixed-height row that scrolls sideways (`getMinHeight` = `getMaxHeight`), so
+  there is no wrapped-height tracking and no ResizeObserver.
+- PromptPalette's Nodes 2.0 grid-row pinning *was* ported (`applyRowSizing`): the Vue node body is
+  a grid whose `align-content: stretch` shares the spare height among all `auto` rows, which
+  inflated the strip and the toolbar. Rows without a textarea become `min-content`; the text
+  fields stay `auto`, never a pixel height, or the node stops being shrinkable. Two
+  MutationObservers keep it applied — one on the grid's `style` (the frontend rewrites
+  `grid-template-rows`), one `childList` on the node root (a remount replaces the grid and strands
+  the first). Both are dropped in `onRemoved` (`releaseRowSizing`), and `applyRowSizing` refuses a
+  node with no `graph` so a late frame cannot latch a removed node onto the element of a reloaded
+  one with the same id. No-op in the classic renderer.
+- Renaming is an inline input, not `window.prompt`; Enter is ignored while `isComposing`, because
+  it also confirms an IME conversion. A strip rebuild commits a rename in progress
+  (`node.__llmwTabCommit`) since not every browser blurs a removed element.
+
 ## Cross-file invariants
+
+`SAVED_WIDGETS` in the JS must list the widgets of `INPUT_TYPES` in the same order.
 
 Constants duplicated between `nodes.py` and `web/llm_widget_ui.js` must be edited in both: the
 route paths under `/llm_widget/`, `ANSWER_EVENT`, the three format ids, `GGUF_MMPROJ_AUTO` /
