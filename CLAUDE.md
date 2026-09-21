@@ -44,6 +44,40 @@ with nothing queued. That is why:
 `_execution_media_items` instead of file paths, and pushes the result back to the editor with
 `PromptServer.send_sync(ANSWER_EVENT)`.
 
+## Route access (`_request_problem`)
+
+Versions 0.1.0–0.1.4 were **banned from the Comfy Registry** for `UNAUTHENTICATED_SIDE_EFFECT`:
+`POST /llm_widget/settings` took `await request.json()` — which ignores `Content-Type`, so a
+cross-origin `text/plain` "simple request" reaches it with no preflight — and wrote the config.
+That is a real exploit, not scanner noise: repoint `api_url` and the next ✦ sends the API key, the
+question and the images to the attacker. The reviewer named the three missing gates (no server-minted
+token / non-simple header, no Host allowlist, no authentication), and every route now goes through
+`refused()` → `_request_problem`:
+
+- same origin: `Sec-Fetch-Site: cross-site` and an `Origin` that does not match `Host` are refused.
+  Core has a middleware like this, but only for loopback hosts and not at all under
+  `--enable-cors-header`, so it is not relied on;
+- `TOKEN_HEADER` must carry `_ROUTE_TOKEN`, minted per process and handed out only by
+  `GET /settings` (the one route checked with `token=False`). The JS sends everything through
+  `callRoute`, which refetches the settings and retries once on a 403, because the token dies with
+  the server while the page lives on. **A new route must call `refused(request)` first, and a new
+  JS call must use `callRoute`, not `api.fetchApi`;**
+- a connection from loopback must have an IP literal or `localhost` as its `Host`. A DNS name there
+  is a rebinding page, which is same-origin with itself and can read the token, so neither other
+  check stops it. `allowed_hosts` in `llm_widget.json` is the escape hatch for a same-machine
+  reverse proxy, and `_update_config` deliberately never takes it from the request.
+
+**The API key never goes back to the editor**: `_public_config` blanks it and adds `api_key_set`;
+the dialog sends `api_key_keep` when the field was not touched and `_update_config` keeps the stored
+key. `isConfigured` therefore reads `api_key_set`, never `api_key`.
+
+What is left in the registry scan is YARA's `python_network_operations` on `urllib.request.urlopen`
+(severity info). It is the node's function — calling the LLM endpoint the user configured — and is
+not to be "fixed" by hiding the call behind `getattr`, `importlib` or string concatenation: that is
+what malware does, and a human reviewer reads it that way. `tools/` is kept out of the registry
+package by `.comfyignore` because `install_helper.py` trips three more rules by design
+(`subprocess`, `os.environ`, GitHub token).
+
 ## Media resolution (split across both files)
 
 1. JS `inputSourceNode` follows the `image` / `video` input link, walking through any node whose
@@ -322,7 +356,7 @@ node.properties["llmw_system_tab_index"] = open tab
 `SAVED_WIDGETS` in the JS must list the widgets of `INPUT_TYPES` in the same order.
 
 Constants duplicated between `nodes.py` and `web/llm_widget_ui.js` must be edited in both: the
-route paths under `/llm_widget/`, `ANSWER_EVENT`, the four format ids and `LOCAL_FORMATS`, `GGUF_MMPROJ_AUTO` /
+route paths under `/llm_widget/`, `ANSWER_EVENT`, `TOKEN_HEADER`, the four format ids and `LOCAL_FORMATS`, `GGUF_MMPROJ_AUTO` /
 `GGUF_MMPROJ_NONE`, `CHAT_USER_MARK` / `CHAT_MODEL_MARK`, the `VIDEO_SAMPLES` ids, `IMAGE_INPUT_MAX` with the socket
 naming (`image`, `image2`, …), and every
 settings key with its clamp range (both sides normalize independently, and the server's

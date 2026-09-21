@@ -23,6 +23,9 @@ const GENERATE_ENDPOINT = `${ROUTE_PREFIX}/generate`;
 const CANCEL_ENDPOINT = `${ROUTE_PREFIX}/generate_cancel`;
 const UNLOAD_ENDPOINT = `${ROUTE_PREFIX}/unload`;
 const ANSWER_EVENT = "llm_widget/answer";
+// Mirrors TOKEN_HEADER in nodes.py. The server mints the value per process and
+// hands it out with the settings; every other route refuses a request without it.
+const TOKEN_HEADER = "X-LLM-Widget-Token";
 
 const FORMAT_OPENAI = "openai";
 const FORMAT_GEMINI = "gemini";
@@ -131,6 +134,8 @@ const SETTINGS_DEFAULTS = Object.freeze({
     gguf_describe_media: false,
     clip_model: "",
     clip_unload_after: false,
+    // Read-only, from the server: the key itself is never sent to the editor.
+    api_key_set: false,
 });
 
 const TEXT = {
@@ -151,6 +156,7 @@ const TEXT = {
     apiFormat: "API format",
     apiUrl: "API URL",
     apiKey: "API key",
+    apiKeyStored: "stored - type to replace it",
     model: "Model",
     temperature: "Temperature",
     maxLength: "Max answer tokens",
@@ -267,7 +273,28 @@ function normalizeSettings(value) {
         gguf_describe_media: asBoolean(source.gguf_describe_media, false),
         clip_model: String(source.clip_model || "").trim(),
         clip_unload_after: asBoolean(source.clip_unload_after, false),
+        api_key_set: asBoolean(source.api_key_set, false),
     };
+}
+
+let routeToken = "";
+
+/**
+ * `api.fetchApi` with the route token on it.
+ *
+ * The token dies with the server process, so a page that outlived a restart
+ * gets a 403 on its first call: the settings are fetched again, which renews
+ * the token, and the call is repeated once.
+ */
+async function callRoute(endpoint, options = {}, retry = true) {
+    if (!routeToken) await loadSettings({ force: true }).catch(() => {});
+    const response = await api.fetchApi(endpoint, {
+        ...options,
+        headers: { ...(options.headers || {}), [TOKEN_HEADER]: routeToken },
+    });
+    if (response.status !== 403 || !retry) return response;
+    routeToken = "";
+    return callRoute(endpoint, options, false);
 }
 
 async function loadSettings({ force = false } = {}) {
@@ -277,6 +304,7 @@ async function loadSettings({ force = false } = {}) {
         const response = await api.fetchApi(SETTINGS_ENDPOINT);
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+        routeToken = String(data.token || "");
         settingsCache = normalizeSettings(data.settings);
         settingsLoaded = true;
         syncAllNodes();
@@ -287,12 +315,14 @@ async function loadSettings({ force = false } = {}) {
     return settingsPromise;
 }
 
-async function saveSettings(value) {
+async function saveSettings(value, keepApiKey = false) {
     const settings = normalizeSettings(value);
-    const response = await api.fetchApi(SETTINGS_ENDPOINT, {
+    const response = await callRoute(SETTINGS_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(settings),
+        // The dialog never received the stored key, so an untouched field has
+        // to say "leave it" rather than send its own emptiness.
+        body: JSON.stringify({ ...settings, api_key_keep: keepApiKey }),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
@@ -303,7 +333,7 @@ async function saveSettings(value) {
 }
 
 async function loadGgufCatalog() {
-    const response = await api.fetchApi(GGUF_ENDPOINT);
+    const response = await callRoute(GGUF_ENDPOINT);
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
     return {
@@ -314,7 +344,7 @@ async function loadGgufCatalog() {
 }
 
 async function loadClipCatalog() {
-    const response = await api.fetchApi(CLIP_ENDPOINT);
+    const response = await callRoute(CLIP_ENDPOINT);
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
     return Array.isArray(data.models) ? data.models : [];
@@ -709,7 +739,12 @@ async function openSettings() {
     apiKey.type = "password";
     apiKey.autocomplete = "off";
     apiKey.spellcheck = false;
-    apiKey.value = settingsCache.api_key;
+    // Empty even when a key is stored: the server keeps it to itself. Typing
+    // replaces it, and leaving the field alone keeps it.
+    apiKey.value = "";
+    apiKey.placeholder = settingsCache.api_key_set ? TEXT.apiKeyStored : "";
+    let apiKeyTouched = false;
+    apiKey.addEventListener("input", () => { apiKeyTouched = true; });
     const model = document.createElement("input");
     model.className = "llmw-control";
     model.type = "text";
@@ -946,7 +981,7 @@ async function openSettings() {
         saveButton.disabled = true;
         error.hidden = true;
         try {
-            await saveSettings(formValues());
+            await saveSettings(formValues(), settingsCache.api_key_set && !apiKeyTouched);
             notify(TEXT.saved, "success");
             close();
         } catch (saveError) {
@@ -1332,7 +1367,7 @@ function releaseRowSizing(node) {
 function isConfigured() {
     if (settingsCache.api_format === FORMAT_GGUF) return Boolean(settingsCache.gguf_model.trim());
     if (settingsCache.api_format === FORMAT_CLIP) return Boolean(settingsCache.clip_model.trim());
-    return Boolean(settingsCache.api_url.trim() && settingsCache.model.trim() && settingsCache.api_key.trim());
+    return Boolean(settingsCache.api_url.trim() && settingsCache.model.trim() && settingsCache.api_key_set);
 }
 
 function clearStatusTimer(node) {
@@ -1551,7 +1586,7 @@ async function generate(node) {
     setStatus(node, "loading");
     syncNode(node);
     try {
-        const response = await api.fetchApi(GENERATE_ENDPOINT, {
+        const response = await callRoute(GENERATE_ENDPOINT, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             signal: controller?.signal,
@@ -1610,7 +1645,7 @@ async function unloadModel(node) {
     if (!button || button.disabled) return;
     button.disabled = true;
     try {
-        const response = await api.fetchApi(UNLOAD_ENDPOINT, { method: "POST" });
+        const response = await callRoute(UNLOAD_ENDPOINT, { method: "POST" });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
         // `detail` carries the server's own wording, e.g. which models it does
@@ -1647,7 +1682,7 @@ function cancelGeneration(node) {
     // Tell the server first: it stops a local GGUF mid-generation, and the
     // abort below only stops this browser from waiting.
     if (requestId) {
-        api.fetchApi(CANCEL_ENDPOINT, {
+        callRoute(CANCEL_ENDPOINT, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ request_id: requestId }),

@@ -325,6 +325,27 @@ Qwen3.8 はオン／オフのスイッチを **深さ** に変えました。テ
 （` ``` `、` ```text `、` ```prompt `）のときだけです。` ```python ` のブロックは書かれたまま
 残すので、コードを頼めばコードがそのまま得られます。
 
+## ルートへのアクセス制限
+
+このノードのルート（`/llm_widget/...`）は設定ファイルを書き換え、API キーを使い、ディスク上のメディアを
+読みます。ComfyUI にはログインが無いので、「ComfyUI のエディタ自身が送ったリクエストか」を次の 3 点で
+確かめ、外れたものは 403 で断ります。
+
+- **同一オリジンであること。** `Sec-Fetch-Site: cross-site` のもの、`Origin` が `Host` と一致しないものは
+  断ります。悪意あるページが `text/plain` で `127.0.0.1:8188` に POST して API URL を書き換える、という
+  攻撃への対策です（書き換えられると、次の実行で API キーと質問がそこへ送られます）。
+- **プロセスごとのトークン。** 起動のたびに発行され、`GET /llm_widget/settings` でだけ渡されます。他の
+  ルートは `X-LLM-Widget-Token` ヘッダにこれが無いと動きません。ComfyUI を再起動するとトークンが
+  変わりますが、エディタは自動で取り直して 1 回だけ再試行します。
+- **このマシンからの接続では、`Host` が IP アドレスか `localhost` であること。** DNS リバインディング対策
+  です。同じマシン上のリバースプロキシ（nginx、Caddy、cloudflared など）越しに独自ドメインで使う場合は、
+  `llm_widget.json` に手で `"allowed_hosts": ["comfy.example.com"]` を足してください。この項目は設定
+  ダイアログからは書き換えられません。LAN 内の別の PC からのアクセスや、外部のプロキシ越しのアクセスには
+  影響しません。
+
+また、**API キーはブラウザに返しません。** 設定ダイアログの欄は保存済みでも空で表示され
+（`stored - type to replace it`）、触らなければそのまま保持、入力すれば置き換え、入力して空にすれば削除です。
+
 ## 開発
 
 - Python の変更には ComfyUI の完全な再起動 が必要です。
@@ -672,6 +693,29 @@ reasoning.
 A fenced answer is unwrapped only when the fence has no language or a prose-ish one
 (` ``` `, ` ```text `, ` ```prompt `). A ` ```python ` block is left exactly as written, so
 asking for code still gives you code.
+
+## Who may call the routes
+
+The routes of this node (`/llm_widget/...`) rewrite the settings file, spend the API key and read
+media off the disk. ComfyUI has no login, so "the ComfyUI editor itself sent this" is established
+by three checks, and anything else gets a 403:
+
+- **Same origin.** A request marked `Sec-Fetch-Site: cross-site`, or whose `Origin` does not match
+  its `Host`, is refused. This is what stops a hostile web page from POSTing `text/plain` to
+  `127.0.0.1:8188` and repointing the API URL — after which the next run would send the API key and
+  the question there.
+- **A per-process token.** Minted at startup and handed out only by `GET /llm_widget/settings`;
+  every other route wants it in an `X-LLM-Widget-Token` header. Restarting ComfyUI changes it, and
+  the editor fetches the new one and retries once on its own.
+- **From this machine, the `Host` has to be an IP address or `localhost`.** That is the DNS
+  rebinding case. If you reach ComfyUI through a reverse proxy on the same machine (nginx, Caddy,
+  cloudflared, …) under a domain of your own, add `"allowed_hosts": ["comfy.example.com"]` to
+  `llm_widget.json` by hand; the settings dialog cannot write that key. Access from another PC on
+  the LAN, or through an external proxy, is not affected.
+
+Also, **the API key is never sent back to the browser.** The field in the settings dialog is
+empty even when a key is stored (`stored - type to replace it`): leave it alone to keep the key,
+type to replace it, type and clear it to remove it.
 
 ## Development
 

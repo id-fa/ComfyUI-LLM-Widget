@@ -17,12 +17,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hmac
 import io
+import ipaddress
 import json
 import logging
 import mimetypes
 import os
 import re
+import secrets
 import tempfile
 import threading
 import time
@@ -39,6 +42,13 @@ ROUTE_PREFIX = "/llm_widget"
 ANSWER_EVENT = "llm_widget/answer"
 CONFIG_FILENAME = "llm_widget.json"
 CONFIG_VERSION = 1
+# Every route wants this header, and only a page served by this ComfyUI can know
+# its value: it is minted per process and handed out by GET /settings, which a
+# cross-origin page cannot read. A custom header also makes the request
+# non-simple, so a browser preflights it instead of just sending it. Duplicated
+# in the JS.
+TOKEN_HEADER = "X-LLM-Widget-Token"
+_ROUTE_TOKEN = secrets.token_urlsafe(32)
 LOG_PREFIX = "LLM Widget: "
 
 FORMAT_OPENAI = "openai"
@@ -190,6 +200,9 @@ CONFIG_DEFAULTS = {
     "gguf_describe_media": False,
     "clip_model": "",
     "clip_unload_after": False,
+    # Extra Host names the routes answer to, for a reverse proxy on this machine.
+    # Hand-edited only: the settings route never writes it.
+    "allowed_hosts": [],
 }
 
 _CONFIG_LOCK = threading.RLock()
@@ -254,6 +267,7 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
     video_sample = str(source.get("video_sample") or "").strip().lower()
     if video_sample not in VIDEO_SAMPLES:
         video_sample = VIDEO_SAMPLE_DEFAULT
+    hosts = source.get("allowed_hosts")
     return {
         "version": CONFIG_VERSION,
         "api_format": api_format,
@@ -276,6 +290,10 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
         "gguf_describe_media": _as_bool(source.get("gguf_describe_media"), False),
         "clip_model": str(source.get("clip_model") or "").strip(),
         "clip_unload_after": _as_bool(source.get("clip_unload_after"), False),
+        "allowed_hosts": [
+            str(host).strip().lower() for host in (hosts if isinstance(hosts, (list, tuple)) else [])
+            if str(host).strip()
+        ],
     }
 
 
@@ -315,6 +333,91 @@ def _write_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
                 except OSError:
                     pass
     return normalized
+
+
+def _public_config(settings: Mapping[str, Any]) -> dict[str, Any]:
+    """The settings as the editor may see them.
+
+    The API key goes in and never comes back out: the dialog only needs to know
+    that one is stored. `allowed_hosts` is not the editor's business at all.
+    """
+    public = {key: value for key, value in settings.items() if key != "allowed_hosts"}
+    public["api_key_set"] = bool(str(public.get("api_key") or "").strip())
+    public["api_key"] = ""
+    return public
+
+
+def _update_config(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply what the settings dialog sent, which is less than the whole file."""
+    with _CONFIG_LOCK:
+        stored = _read_config()
+        merged = dict(payload)
+        # What decides who may call the routes cannot be settable through one.
+        merged["allowed_hosts"] = stored["allowed_hosts"]
+        # The dialog never had the key, so an untouched field means "as it was".
+        if _as_bool(payload.get("api_key_keep")):
+            merged["api_key"] = stored["api_key"]
+        return _write_config(merged)
+
+
+# --------------------------------------------------------------------------- #
+# Route access
+# --------------------------------------------------------------------------- #
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _request_problem(request, token: bool = True) -> str:
+    """Why this request may not use the routes, or "" when it may.
+
+    These routes write the settings file, spend the API key and read media off
+    the disk, and ComfyUI has no login, so "the editor page sent this" is the
+    only authority there is. Three things establish it:
+
+    - the page is same-origin: no cross-site fetch metadata, and an `Origin`
+      that names the host it was sent to. ComfyUI has a middleware for this,
+      but only for loopback, and not at all under `--enable-cors-header`;
+    - the `Host` of a connection from this machine is an address or
+      `localhost`. A DNS name there is what a rebinding page looks like: it is
+      same-origin with itself, so the first check and the token both pass it;
+    - the request carries the per-process token (every route but the one that
+      hands it out).
+    """
+    headers = request.headers
+    if str(headers.get("Sec-Fetch-Site") or "").lower() == "cross-site":
+        return "Cross-site requests are not accepted"
+    host = urllib.parse.urlsplit("//" + str(headers.get("Host") or "").strip().lower())
+    origin_header = str(headers.get("Origin") or "").strip().lower()
+    if origin_header:
+        origin = urllib.parse.urlsplit(origin_header)
+        same = bool(origin.hostname) and origin.hostname == host.hostname
+        try:
+            # A proxy may drop the port on one side, so it only counts when both have one.
+            if same and origin.port is not None and host.port is not None:
+                same = origin.port == host.port
+        except ValueError:
+            same = False
+        if not same:
+            return "The request's Origin does not match its Host"
+    hostname = host.hostname or ""
+    remote = str(getattr(request, "remote", "") or "")
+    local_peer = _is_ip_literal(remote) and ipaddress.ip_address(remote).is_loopback
+    if local_peer and hostname != "localhost" and not _is_ip_literal(hostname):
+        if hostname not in _read_config()["allowed_hosts"]:
+            return (
+                f"Host '{hostname}' is not accepted from this machine. If ComfyUI is behind a local "
+                f"reverse proxy, add it to \"allowed_hosts\" in {CONFIG_FILENAME}."
+            )
+    sent = str(headers.get(TOKEN_HEADER) or "").encode("utf-8", errors="replace")
+    if token and not hmac.compare_digest(sent, _ROUTE_TOKEN.encode("utf-8")):
+        return "Missing or stale token. Reload the page."
+    return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -2321,20 +2424,40 @@ def _register_routes() -> bool:
     if routes is None or getattr(_register_routes, "_registered", False):
         return bool(getattr(_register_routes, "_registered", False))
 
+    def refused(request, token: bool = True):
+        """The 403 for a request `_request_problem` turns away, else None."""
+        problem = _request_problem(request, token)
+        if not problem:
+            return None
+        logging.warning(LOG_PREFIX + "refused %s %s: %s", request.method, request.path, problem)
+        return web.json_response({"ok": False, "forbidden": True, "error": problem}, status=403)
+
     @routes.get(f"{ROUTE_PREFIX}/settings")
     async def _settings_get(request):
-        return web.json_response({"ok": True, "settings": _read_config()})
+        # The one route without the token: this is where the editor gets it. A
+        # page from anywhere else can send this request but not read the answer.
+        denied = refused(request, token=False)
+        if denied is not None:
+            return denied
+        return web.json_response({"ok": True, "settings": _public_config(_read_config()), "token": _ROUTE_TOKEN})
 
     @routes.post(f"{ROUTE_PREFIX}/settings")
     async def _settings_post(request):
+        denied = refused(request)
+        if denied is not None:
+            return denied
         try:
             payload = await request.json()
-            return web.json_response({"ok": True, "settings": _write_config(payload if isinstance(payload, dict) else {})})
+            saved = await asyncio.to_thread(_update_config, payload if isinstance(payload, dict) else {})
+            return web.json_response({"ok": True, "settings": _public_config(saved)})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
     @routes.get(f"{ROUTE_PREFIX}/gguf_models")
     async def _gguf_models_get(request):
+        denied = refused(request)
+        if denied is not None:
+            return denied
         try:
             models, projectors = await asyncio.to_thread(_gguf_catalog)
             return web.json_response({
@@ -2348,6 +2471,9 @@ def _register_routes() -> bool:
 
     @routes.get(f"{ROUTE_PREFIX}/clip_models")
     async def _clip_models_get(request):
+        denied = refused(request)
+        if denied is not None:
+            return denied
         try:
             return web.json_response({
                 "ok": True,
@@ -2365,6 +2491,9 @@ def _register_routes() -> bool:
         server it is a request to LM Studio's REST API. Gemini has nothing to
         free, and the button is not shown for it.
         """
+        denied = refused(request)
+        if denied is not None:
+            return denied
         try:
             settings = _read_config()
             api_format = str(settings.get("api_format") or FORMAT_OPENAI).lower()
@@ -2394,6 +2523,9 @@ def _register_routes() -> bool:
 
     @routes.post(f"{ROUTE_PREFIX}/generate_cancel")
     async def _generate_cancel(request):
+        denied = refused(request)
+        if denied is not None:
+            return denied
         try:
             payload = await request.json()
             request_id = str((payload or {}).get("request_id") or "")
@@ -2406,6 +2538,9 @@ def _register_routes() -> bool:
 
     @routes.post(f"{ROUTE_PREFIX}/generate")
     async def _generate_route(request):
+        denied = refused(request)
+        if denied is not None:
+            return denied
         request_id = ""
         try:
             payload = await request.json()
