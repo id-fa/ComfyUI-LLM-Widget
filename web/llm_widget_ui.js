@@ -18,6 +18,7 @@ const NODE_NAME = "LLMWidget";
 const ROUTE_PREFIX = "/llm_widget";
 const SETTINGS_ENDPOINT = `${ROUTE_PREFIX}/settings`;
 const GGUF_ENDPOINT = `${ROUTE_PREFIX}/gguf_models`;
+const CLIP_ENDPOINT = `${ROUTE_PREFIX}/clip_models`;
 const GENERATE_ENDPOINT = `${ROUTE_PREFIX}/generate`;
 const CANCEL_ENDPOINT = `${ROUTE_PREFIX}/generate_cancel`;
 const UNLOAD_ENDPOINT = `${ROUTE_PREFIX}/unload`;
@@ -26,11 +27,15 @@ const ANSWER_EVENT = "llm_widget/answer";
 const FORMAT_OPENAI = "openai";
 const FORMAT_GEMINI = "gemini";
 const FORMAT_GGUF = "gguf";
-const FORMATS = [FORMAT_OPENAI, FORMAT_GEMINI, FORMAT_GGUF];
+const FORMAT_CLIP = "clip";
+const FORMATS = [FORMAT_OPENAI, FORMAT_GEMINI, FORMAT_GGUF, FORMAT_CLIP];
+// The two that run inside ComfyUI and hold a model of their own to unload.
+const LOCAL_FORMATS = [FORMAT_GGUF, FORMAT_CLIP];
 const FORMAT_LABELS = {
     [FORMAT_OPENAI]: "OpenAI-compatible",
     [FORMAT_GEMINI]: "Gemini",
     [FORMAT_GGUF]: "GGUF (llama-cpp-python)",
+    [FORMAT_CLIP]: "ComfyUI text encoder (safetensors)",
 };
 
 const THINKING_OFF = "off";
@@ -72,9 +77,19 @@ const SYSTEM_TAB_LIMIT = 20;
 // and frontends disagree on whether a non-serialized widget holds an index.
 const SAVED_WIDGETS = ["system_prompt", "generate_on_execute", "answer", "question"];
 
+// Mirrors IMAGE_INPUT_MAX in nodes.py: the sockets are `image`, `image2` …
+// `image10`, and each is tagged with its socket number rather than its rank
+// among the connected ones, so "image 3" stays image 3 with socket 2 empty.
+const IMAGE_INPUT_MAX = 10;
 const MEDIA_INPUTS = [
-    { name: "image", type: "image", icon: "▣" },
-    { name: "video", type: "video", icon: "▶" },
+    ...Array.from({ length: IMAGE_INPUT_MAX }, (_unused, index) => ({
+        name: index ? `image${index + 1}` : "image",
+        type: "image",
+        tag: `image ${index + 1}`,
+        // The number is on the chip because it is what the question refers to.
+        icon: `▣${index + 1}`,
+    })),
+    { name: "video", type: "video", tag: "video 1", icon: "▶" },
 ];
 const MEDIA_EXTENSIONS = /\.(png|jpe?g|webp|gif|bmp|tiff?|mp4|webm|mov|mkv|avi|m4v)$/i;
 const ANNOTATED_PATH_RE = /\s*\[(input|output|temp)\]\s*$/i;
@@ -114,6 +129,8 @@ const SETTINGS_DEFAULTS = Object.freeze({
     gguf_gpu_layers: -1,
     gguf_unload_after: false,
     gguf_describe_media: false,
+    clip_model: "",
+    clip_unload_after: false,
 });
 
 const TEXT = {
@@ -143,6 +160,7 @@ const TEXT = {
     ggufGpuLayers: "GPU layers (-1 = all)",
     ggufUnload: "Unload the model after answering",
     ggufDescribe: "Describe each media in its own pass",
+    clipModel: "Text encoder",
     readMedia: "Send the connected image / video",
     videoSample: "Video frames sent",
     videoSampleHint:
@@ -171,6 +189,12 @@ const TEXT = {
     cancelled: "Generation stopped",
     missingHttp: "Set the API URL, key and model in the settings first",
     missingGguf: "Select a GGUF model in the settings first",
+    missingClip: "Select a text encoder in the settings first",
+    clipEmpty: "No .safetensors found under models/text_encoders",
+    clipHint:
+        "Runs a text encoder in ComfyUI's own format as the LLM - the Qwen3-VL a Qwen-Image workflow "
+        + "already loads, for one. It has to be an LLM-based encoder (Qwen3-VL, Qwen3.5, Gemma), not a CLIP "
+        + "or T5, and it is refused while a workflow is running.",
     emptyQuestion: "Type a question first",
     ggufEmpty: "No .gguf found under models/text_encoders or models/LLM",
     ggufAuto: "auto (next to the model)",
@@ -241,6 +265,8 @@ function normalizeSettings(value) {
         gguf_gpu_layers: clampNumber(source.gguf_gpu_layers, -1, -1, 1024),
         gguf_unload_after: asBoolean(source.gguf_unload_after, false),
         gguf_describe_media: asBoolean(source.gguf_describe_media, false),
+        clip_model: String(source.clip_model || "").trim(),
+        clip_unload_after: asBoolean(source.clip_unload_after, false),
     };
 }
 
@@ -285,6 +311,13 @@ async function loadGgufCatalog() {
         mmproj: Array.isArray(data.mmproj) ? data.mmproj : [],
         roots: Array.isArray(data.roots) ? data.roots : [],
     };
+}
+
+async function loadClipCatalog() {
+    const response = await api.fetchApi(CLIP_ENDPOINT);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+    return Array.isArray(data.models) ? data.models : [];
 }
 
 function notify(message, severity = "error") {
@@ -429,13 +462,13 @@ function sourceLabel(node) {
 /** What the run button will send, in the order the server tags it. */
 function mediaResources(node) {
     const resources = [];
-    for (const { name, type, icon } of MEDIA_INPUTS) {
+    for (const { name, type, tag, icon } of MEDIA_INPUTS) {
         const source = inputSourceNode(node, name);
         if (!source) continue;
         const asset = sourceAsset(source, type);
         resources.push({
             type,
-            tag: `${type} 1`,
+            tag,
             icon,
             name: asset?.filename || sourceLabel(source),
             asset,
@@ -706,6 +739,10 @@ async function openSettings() {
     const chatBlankLines = makeSwitch(settingsCache.chat_blank_lines);
     const ggufUnload = makeSwitch(settingsCache.gguf_unload_after);
     const ggufDescribe = makeSwitch(settingsCache.gguf_describe_media);
+    const clipModel = makeSelect(settingsCache.clip_model, null, [
+        { value: settingsCache.clip_model, label: settingsCache.clip_model || TEXT.clipEmpty },
+    ]);
+    const clipUnload = makeSwitch(settingsCache.clip_unload_after);
 
     const hint = document.createElement("p");
     hint.className = "llmw-hint";
@@ -735,6 +772,8 @@ async function openSettings() {
     continueHint.textContent = TEXT.continueHint;
     const ggufUnloadRow = makeCheckRow(TEXT.ggufUnload, ggufUnload);
     const ggufDescribeRow = makeCheckRow(TEXT.ggufDescribe, ggufDescribe);
+    const clipModelRow = makeRow(TEXT.clipModel, clipModel);
+    const clipUnloadRow = makeCheckRow(TEXT.ggufUnload, clipUnload);
 
     form.append(
         makeRow(TEXT.apiFormat, apiFormat),
@@ -746,6 +785,7 @@ async function openSettings() {
         ggufMmprojRow,
         ggufContextRow,
         ggufGpuLayersRow,
+        clipModelRow,
         thinkingRow,
         thinkingHint,
         temperatureRow,
@@ -755,6 +795,7 @@ async function openSettings() {
         chatBlankLinesRow,
         continueHint,
         ggufUnloadRow,
+        clipUnloadRow,
         readMediaRow,
         ggufDescribeRow,
         videoSampleRow,
@@ -790,11 +831,29 @@ async function openSettings() {
             error.hidden = false;
         });
     };
+    let clipCatalogLoaded = false;
+    const refreshClipOptions = () => {
+        if (clipCatalogLoaded) return;
+        clipCatalogLoaded = true;
+        loadClipCatalog().then((names) => {
+            const selected = clipModel.value;
+            const models = names.map((value) => ({ value, label: value }));
+            if (selected && !names.includes(selected)) models.push({ value: selected, label: selected });
+            clipModel.setOptions(models.length ? models : [{ value: "", label: TEXT.clipEmpty }]);
+            clipModel.value = selected;
+        }).catch((catalogError) => {
+            clipCatalogLoaded = false;
+            error.textContent = String(catalogError?.message || catalogError);
+            error.hidden = false;
+        });
+    };
     const syncFormatRows = () => {
         const gguf = apiFormat.value === FORMAT_GGUF;
         const gemini = apiFormat.value === FORMAT_GEMINI;
-        for (const row of [apiUrlRow, apiKeyRow, modelRow]) row.hidden = gguf;
+        const clip = apiFormat.value === FORMAT_CLIP;
+        for (const row of [apiUrlRow, apiKeyRow, modelRow]) row.hidden = gguf || clip;
         for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadRow]) row.hidden = !gguf;
+        for (const row of [clipModelRow, clipUnloadRow]) row.hidden = !clip;
         // Describing media one at a time only means something once media is sent.
         ggufDescribeRow.hidden = !gguf || !readMedia.checked;
         // So does how many frames a video is thinned to.
@@ -804,9 +863,10 @@ async function openSettings() {
         // questions once there is a log at all.
         historyTurnsRow.hidden = !continueChat.checked;
         chatBlankLinesRow.hidden = !continueChat.checked;
-        hint.textContent = gguf ? TEXT.ggufHint : gemini ? TEXT.geminiHint : TEXT.httpHint;
+        hint.textContent = gguf ? TEXT.ggufHint : clip ? TEXT.clipHint : gemini ? TEXT.geminiHint : TEXT.httpHint;
         apiUrl.placeholder = gemini ? "https://generativelanguage.googleapis.com" : "http://127.0.0.1:1234/v1";
         if (gguf) refreshGgufOptions();
+        if (clip) refreshClipOptions();
     };
     syncFormatRows();
 
@@ -845,6 +905,8 @@ async function openSettings() {
         gguf_gpu_layers: ggufGpuLayers.value,
         gguf_unload_after: ggufUnload.checked,
         gguf_describe_media: ggufDescribe.checked,
+        clip_model: clipModel.value,
+        clip_unload_after: clipUnload.checked,
     });
     // Compared through normalizeSettings so the number inputs' string values and
     // a clamped-away edit do not count as a change.
@@ -872,7 +934,7 @@ async function openSettings() {
     settingsModal = { dialog, close };
     document.addEventListener("keydown", onKeyDown, true);
     overlay.addEventListener("pointerdown", (event) => {
-        for (const select of [apiFormat, thinking, ggufModel, ggufMmproj, videoSample]) {
+        for (const select of [apiFormat, thinking, ggufModel, ggufMmproj, clipModel, videoSample]) {
             if (!select.contains?.(event.target)) select.closeMenu?.();
         }
         if (event.target === overlay) requestClose();
@@ -1269,6 +1331,7 @@ function releaseRowSizing(node) {
 
 function isConfigured() {
     if (settingsCache.api_format === FORMAT_GGUF) return Boolean(settingsCache.gguf_model.trim());
+    if (settingsCache.api_format === FORMAT_CLIP) return Boolean(settingsCache.clip_model.trim());
     return Boolean(settingsCache.api_url.trim() && settingsCache.model.trim() && settingsCache.api_key.trim());
 }
 
@@ -1320,7 +1383,7 @@ function syncNode(node) {
         // Gemini holds nothing. The local backend frees its own cache, and an
         // OpenAI-compatible one is asked to — which only LM Studio answers, but
         // that is the local server people actually run out of VRAM with.
-        const local = settingsCache.api_format === FORMAT_GGUF;
+        const local = LOCAL_FORMATS.includes(settingsCache.api_format);
         unloadButton.hidden = settingsCache.api_format === FORMAT_GEMINI;
         unloadButton.disabled = pending;
         unloadButton.title = local ? TEXT.unload : TEXT.unloadHttp;
@@ -1345,7 +1408,7 @@ function syncMediaLine(node, { force = false } = {}) {
     const line = node?.__llmwMedia;
     if (!line) return;
     const resources = mediaResources(node);
-    const signature = JSON.stringify([settingsCache.read_media, resources.map((item) => [item.type, item.name, Boolean(item.asset)])]);
+    const signature = JSON.stringify([settingsCache.read_media, resources.map((item) => [item.tag, item.name, Boolean(item.asset)])]);
     if (!force && signature === node.__llmwMediaSignature) return;
     node.__llmwMediaSignature = signature;
     line.textContent = "";
@@ -1420,10 +1483,16 @@ function installToolbar(node) {
     bar.append(status, settingsButton, clearButton, copyButton, unloadButton, gap, runButton);
     wrap.append(media, bar);
     // The canvas would otherwise zoom while the pointer sits over the toolbar.
+    // Over the chips it scrolls them instead, when ten images and a video do
+    // not fit: the row stays one line high, like the tab strip.
     wrap.addEventListener("wheel", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        app.canvas?.processMouseWheel?.(event);
+        if (media.contains(event.target) && media.scrollWidth > media.clientWidth) {
+            media.scrollLeft += event.deltaY || event.deltaX;
+        } else {
+            app.canvas?.processMouseWheel?.(event);
+        }
     }, { passive: false });
 
     const widget = node.addDOMWidget("llmw_toolbar", "llmw_toolbar", wrap, {
@@ -1464,7 +1533,7 @@ async function generate(node) {
         return;
     }
     if (!isConfigured()) {
-        notify(settingsCache.api_format === FORMAT_GGUF ? TEXT.missingGguf : TEXT.missingHttp, "warn");
+        notify({ [FORMAT_GGUF]: TEXT.missingGguf, [FORMAT_CLIP]: TEXT.missingClip }[settingsCache.api_format] || TEXT.missingHttp, "warn");
         openSettings();
         return;
     }
@@ -1678,10 +1747,11 @@ function installStyle() {
       .llmw-tool.is-run.is-stop { color: #f28b82; border-color: rgba(242,139,130,.45); background: rgba(242,139,130,.12); font-size: 11px; }
       .llmw-status { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: rgba(227,227,227,.55); font-size: 11px; }
       .llmw-status.is-loading { color: #a8c7fa; }
-      .llmw-media { display: flex; flex-wrap: wrap; gap: 4px; }
+      .llmw-media { display: flex; flex-wrap: nowrap; gap: 4px; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+      .llmw-media::-webkit-scrollbar { display: none; }
       .llmw-media[hidden] { display: none !important; }
       .llmw-chip {
-        max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 7px; border: 1px solid rgba(255,255,255,.1);
+        flex: 0 0 auto; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 7px; border: 1px solid rgba(255,255,255,.1);
         border-radius: 999px; background: rgba(255,255,255,.04); color: rgba(227,227,227,.6); font-size: 10px; line-height: 16px;
       }
       .llmw-chip.is-missing { border-color: rgba(242,139,130,.35); color: rgba(242,139,130,.85); text-decoration: line-through; }

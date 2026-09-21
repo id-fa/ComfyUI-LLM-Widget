@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import logging
@@ -43,7 +44,12 @@ LOG_PREFIX = "LLM Widget: "
 FORMAT_OPENAI = "openai"
 FORMAT_GEMINI = "gemini"
 FORMAT_GGUF = "gguf"
-FORMATS = (FORMAT_OPENAI, FORMAT_GEMINI, FORMAT_GGUF)
+# A text encoder in ComfyUI's own safetensors format, run through comfy's
+# `CLIP.generate` — the encoder an image model already needs, used as the LLM.
+FORMAT_CLIP = "clip"
+FORMATS = (FORMAT_OPENAI, FORMAT_GEMINI, FORMAT_GGUF, FORMAT_CLIP)
+# The two backends that run in this process and hold a model of their own.
+LOCAL_FORMATS = (FORMAT_GGUF, FORMAT_CLIP)
 
 # Ask the model not to reason, and drop any block it emits anyway.
 THINKING_OFF = "off"
@@ -81,6 +87,12 @@ GGUF_CONTEXT = 16384
 GGUF_CONTEXT_MIN = 512
 GGUF_CONTEXT_LIMIT = 1048576
 GGUF_GPU_LAYERS = -1
+CLIP_DIR = "text_encoders"
+CLIP_EXTENSIONS = (".safetensors", ".sft")
+# comfy's Qwen image preprocessor keeps up to 12.8 MP, which is several thousand
+# vision tokens for one photo. An image is shrunk to this side before it is
+# handed over: about a thousand tokens each, so ten of them still fit.
+CLIP_IMAGE_MAX_SIDE = 1024
 
 # A chat message has no video channel, so a connected video is described from
 # stills instead. How many stills it becomes is a setting: candidates are taken
@@ -107,6 +119,13 @@ VIDEO_SAMPLE_ORDER = "in chronological order"
 STILL_MAX_SIDE = 768
 # How many frames of a connected IMAGE batch are attached during execution.
 IMAGE_BATCH_STILLS = 4
+# The node has this many IMAGE sockets: `image`, then `image2` … `image10`. The
+# first keeps its old name so a workflow saved with one socket still connects.
+# A multi-reference edit model addresses its inputs by number, so the tag an
+# image is sent under is its *socket* number, not its rank among the connected
+# ones — "image 3" stays image 3 with socket 2 left empty. Duplicated in the JS
+# as IMAGE_INPUT_MAX.
+IMAGE_INPUT_MAX = 10
 MEDIA_MAX_BYTES = 32 * 1024 * 1024
 CANCEL_LIMIT = 64
 
@@ -169,6 +188,8 @@ CONFIG_DEFAULTS = {
     "gguf_gpu_layers": GGUF_GPU_LAYERS,
     "gguf_unload_after": False,
     "gguf_describe_media": False,
+    "clip_model": "",
+    "clip_unload_after": False,
 }
 
 _CONFIG_LOCK = threading.RLock()
@@ -253,6 +274,8 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
         "gguf_gpu_layers": integer("gguf_gpu_layers", GGUF_GPU_LAYERS, -1, 1024),
         "gguf_unload_after": _as_bool(source.get("gguf_unload_after"), False),
         "gguf_describe_media": _as_bool(source.get("gguf_describe_media"), False),
+        "clip_model": str(source.get("clip_model") or "").strip(),
+        "clip_unload_after": _as_bool(source.get("clip_unload_after"), False),
     }
 
 
@@ -1893,6 +1916,292 @@ def _gguf_generate(
 
 
 # --------------------------------------------------------------------------- #
+# ComfyUI text encoder backend (comfy.sd.CLIP.generate)
+# --------------------------------------------------------------------------- #
+
+# comfy's chat-capable tokenizers leave a text that already opens a turn alone
+# instead of wrapping it in their single-turn template. That is what lets the
+# system prompt, the earlier turns and several images reach the model at all.
+# Keyed by the prefix of the tokenizer's `clip_name`; the value is the closed
+# thought block that family reads as "do not reason".
+_CLIP_CHATML_FAMILIES = {
+    "qwen3vl": "<think>\n\n</think>\n\n",
+    "qwen35": "<think>\n</think>\n",
+}
+_CLIP_VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
+
+_CLIP_LOCK = threading.RLock()
+_CLIP_STATE: dict[str, Any] = {"path": None, "clip": None}
+# Same reason as _GGUF_BUSY: ⏏ must not take the weights from under a run.
+_CLIP_BUSY = 0
+
+
+def _clip_hold(delta: int) -> None:
+    global _CLIP_BUSY
+    with _CLIP_LOCK:
+        _CLIP_BUSY = max(0, _CLIP_BUSY + delta)
+
+
+def _clip_catalog() -> list[str]:
+    """The safetensors text encoders ComfyUI lists, by their loader names."""
+    try:
+        names = folder_paths.get_filename_list(CLIP_DIR)
+    except Exception:
+        return []
+    return sorted(name for name in names if str(name).lower().endswith(CLIP_EXTENSIONS))
+
+
+def _clip_release() -> None:
+    with _CLIP_LOCK:
+        clip = _CLIP_STATE.get("clip")
+        _CLIP_STATE["clip"] = None
+        _CLIP_STATE["path"] = None
+    if clip is None:
+        return
+    try:
+        import comfy.model_management
+
+        # Dropping the reference alone leaves the weights on the GPU until
+        # comfy next collects its loaded-model list.
+        comfy.model_management.unload_model_and_clones(clip.patcher)
+        del clip
+        comfy.model_management.soft_empty_cache()
+    except Exception as exc:
+        logging.warning(LOG_PREFIX + "could not unload the text encoder cleanly (%s).", exc)
+
+
+def _clip_unload_now() -> str:
+    """`_gguf_unload_now` for this backend: `busy`, `idle` or `unloaded`."""
+    with _CLIP_LOCK:
+        if _CLIP_BUSY > 0:
+            return "busy"
+        if _CLIP_STATE.get("clip") is None:
+            return "idle"
+        _clip_release()
+    return "unloaded"
+
+
+def _clip_model(settings: Mapping[str, Any]):
+    """Load (or reuse) the configured text encoder through comfy's own loader."""
+    requested = str(settings.get("clip_model") or "").strip()
+    if not requested:
+        raise ValueError("Select a text encoder in the settings")
+    path = folder_paths.get_full_path(CLIP_DIR, requested)
+    if not path:
+        raise ValueError(f"Text encoder not found in models/{CLIP_DIR}: {requested}")
+    with _CLIP_LOCK:
+        if _CLIP_STATE.get("clip") is not None and _CLIP_STATE.get("path") == path:
+            return _CLIP_STATE["clip"]
+    _clip_release()
+
+    import comfy.sd
+
+    _log("loading text encoder %s...", requested)
+    started = time.perf_counter()
+    # No clip type: the generic wrapper of each family is the one that generates.
+    # A type would select an image model's conditioning variant of it instead.
+    clip = comfy.sd.load_clip(
+        ckpt_paths=[path], embedding_directory=folder_paths.get_folder_paths("embeddings"),
+    )
+    # Every comfy encoder wrapper has a `generate`; what a CLIP or T5 lacks is
+    # the language model underneath for it to forward to.
+    wrapper = clip.cond_stage_model
+    inner = getattr(wrapper, str(getattr(wrapper, "clip", "")), wrapper)
+    # A wrapper built some other way is left to fail in `generate` itself.
+    transformer = getattr(inner, "transformer", None)
+    if transformer is not None and not callable(getattr(transformer, "generate", None)):
+        del clip, wrapper, inner, transformer
+        raise ValueError(
+            f"{requested} is a text encoder ComfyUI cannot generate text with. "
+            "Pick an LLM-based one (Qwen3-VL, Qwen3.5, Gemma)."
+        )
+    _log("text encoder loaded in %.1fs", time.perf_counter() - started)
+    with _CLIP_LOCK:
+        _CLIP_STATE["clip"] = clip
+        _CLIP_STATE["path"] = path
+    return clip
+
+
+def _clip_image_tensors(parts: Sequence[Mapping[str, Any]]) -> list[Any]:
+    """The request's image parts as the `[1, H, W, 3]` tensors comfy tokenizes.
+
+    Going back through the encoded parts rather than around them keeps one media
+    pipeline: the sampling, the manifest and the skip report are already decided
+    by the time a backend is chosen.
+    """
+    import numpy
+    import torch
+    from PIL import Image
+
+    tensors = []
+    for part in parts:
+        url = str((part.get("image_url") or {}).get("url") or "")
+        if not url.startswith("data:") or "," not in url:
+            continue
+        try:
+            image = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))).convert("RGB")
+        except Exception as exc:
+            logging.warning(LOG_PREFIX + "could not decode an attached image (%s).", exc)
+            continue
+        longest = max(image.width, image.height)
+        if longest > CLIP_IMAGE_MAX_SIDE:
+            scale = CLIP_IMAGE_MAX_SIDE / float(longest)
+            image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))))
+        tensors.append(torch.from_numpy(numpy.asarray(image).astype(numpy.float32) / 255.0).unsqueeze(0))
+    return tensors
+
+
+def _clip_tokens(
+    clip,
+    system_prompt: str,
+    user_text: str,
+    images: Sequence[Any],
+    no_think: bool,
+    history: Sequence[Mapping[str, str]] | None,
+):
+    """Tokenize one turn, as a full chat where the tokenizer allows one."""
+    name = str(getattr(clip.tokenizer, "clip_name", "") or "")
+    family = next((key for key in _CLIP_CHATML_FAMILIES if name.startswith(key)), "")
+    if family:
+        turns = []
+        if system_prompt.strip():
+            turns.append(f"<|im_start|>system\n{system_prompt.strip()}<|im_end|>\n")
+        # Text only, like every other backend.
+        turns.extend(
+            f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n" for message in (history or [])
+        )
+        turns.append(f"<|im_start|>user\n{_CLIP_VISION_BLOCK * len(images)}{user_text}<|im_end|>\n")
+        turns.append("<|im_start|>assistant\n" + (_CLIP_CHATML_FAMILIES[family] if no_think else ""))
+        return clip.tokenize("".join(turns), images=list(images), min_length=1)
+
+    # Any other family only has comfy's own single-turn template, so the system
+    # prompt and the log ride inside the user text, and the images go in as one
+    # batch — which needs them to be one size.
+    import torch
+
+    blocks = [system_prompt.strip()] if system_prompt.strip() else []
+    blocks.extend(
+        f"{CHAT_USER_MARK if message['role'] == 'user' else CHAT_MODEL_MARK} {message['content']}"
+        for message in (history or [])
+    )
+    blocks.append(user_text)
+    batch = None
+    if images:
+        import comfy.utils
+
+        height, width = int(images[0].shape[1]), int(images[0].shape[2])
+        batch = torch.cat([
+            image if tuple(image.shape[1:3]) == (height, width)
+            else comfy.utils.common_upscale(image.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
+            for image in images
+        ], dim=0)
+    return clip.tokenize("\n\n".join(blocks), image=batch, skip_template=False, min_length=1, thinking=not no_think)
+
+
+def _clip_workflow_running() -> bool:
+    try:
+        from server import PromptServer
+
+        queue = getattr(getattr(PromptServer, "instance", None), "prompt_queue", None)
+        return bool(getattr(queue, "currently_running", None))
+    except Exception:
+        return False
+
+
+@contextlib.contextmanager
+def _clip_cancel_hook(should_stop):
+    """Make comfy's token loop stoppable from the editor.
+
+    `generate` takes no callback, but it ticks a `ProgressBar`, and a progress
+    bar calls the global hook. The server's hook is swapped for one that polls
+    the cancel registry — on this thread only, so a workflow queued meanwhile
+    keeps its progress. The server's own hook is not called for this run: it
+    reports to whichever node executed last.
+    """
+    if should_stop is None:
+        yield
+        return
+    import comfy.utils
+
+    original = comfy.utils.PROGRESS_BAR_HOOK
+    owner = threading.get_ident()
+
+    def hook(value, total, preview=None, **kwargs):
+        if threading.get_ident() != owner:
+            return original(value, total, preview, **kwargs) if original is not None else None
+        if should_stop():
+            raise _Cancelled("Cancelled")
+        return None
+
+    comfy.utils.PROGRESS_BAR_HOOK = hook
+    try:
+        yield
+    finally:
+        if comfy.utils.PROGRESS_BAR_HOOK is hook:
+            comfy.utils.PROGRESS_BAR_HOOK = original
+
+
+def _clip_generate(
+    settings: Mapping[str, Any],
+    system_prompt: str,
+    user_prompt: str,
+    media_parts: Sequence[Mapping[str, Any]] | None = None,
+    should_stop=None,
+    history: Sequence[Mapping[str, str]] | None = None,
+    executing: bool = False,
+) -> str:
+    """Run the question through a ComfyUI text encoder and return the answer."""
+    import torch
+
+    # comfy's model management has no lock of its own: loading a model from
+    # this thread while the executor is moving its own would race over the
+    # same VRAM bookkeeping. Inside an execution this *is* the executor.
+    if not executing and _clip_workflow_running():
+        raise ValueError("ComfyUI is running a workflow. Ask again when it has finished.")
+    started = time.perf_counter()
+    max_tokens = int(settings.get("max_length") or MAX_LENGTH_DEFAULT)
+    temperature = float(settings.get("temperature", CONFIG_DEFAULTS["temperature"]))
+    no_think = str(settings.get("thinking") or THINKING_OFF).lower() != THINKING_KEEP
+    try:
+        # The executor runs nodes under inference_mode, and a model loaded under
+        # one mode is not usable under the other, so both callers use it.
+        with torch.inference_mode():
+            clip = _clip_model(settings)
+            images = _clip_image_tensors([
+                part for part in (media_parts or []) if part.get("type") == "image_url"
+            ])
+            _log(
+                "asking text encoder %s (system=%d chars, question=%d chars, images=%d, history=%d turns, "
+                "max_tokens=%d, thinking=%s)",
+                str(settings.get("clip_model") or ""), len(system_prompt), len(user_prompt), len(images),
+                len(history or []), max_tokens, "off" if no_think else "kept",
+            )
+            tokens = _clip_tokens(clip, system_prompt, user_prompt, images, no_think, history)
+            with _clip_cancel_hook(should_stop):
+                ids = clip.generate(
+                    tokens, do_sample=temperature > 0.0, max_length=max_tokens, temperature=max(temperature, 0.01),
+                    top_k=64, top_p=0.95, min_p=0.05, repetition_penalty=1.05, seed=0,
+                )
+            raw = clip.decode(ids)
+    except _Cancelled:
+        _clip_release()
+        raise
+    finally:
+        if _as_bool(settings.get("clip_unload_after")):
+            _clip_release()
+    text = _clean_output(raw, no_think)
+    if not text and no_think and _opens_with_thinking(raw):
+        raise ValueError(
+            f"The model spent all {max_tokens} tokens reasoning and never reached an answer. "
+            "Raise Max answer tokens, or use a model whose thinking can be switched off."
+        )
+    if not text:
+        raise ValueError("The text encoder returned an empty answer")
+    _log("finished in %.1fs (%d tokens, %d chars)", time.perf_counter() - started, len(ids), len(text))
+    return text
+
+
+# --------------------------------------------------------------------------- #
 # Shared pipeline
 # --------------------------------------------------------------------------- #
 
@@ -1904,13 +2213,15 @@ def _generate(
     media_items: Sequence[Mapping[str, Any]],
     should_stop=None,
     transcript: str = "",
+    executing: bool = False,
 ) -> str:
     """Run one question through the configured backend.
 
     `media_items` are already-resolved parts, so the same pipeline serves the
     editor route (file paths) and node execution (tensors). `transcript` is the
     raw answer widget; parsing it here means the log the user sees is the only
-    definition of what the conversation is.
+    definition of what the conversation is. `executing` says the caller is the
+    graph executor, which only the text encoder backend needs to know.
     """
     api_format = str(settings.get("api_format") or FORMAT_OPENAI).lower()
     history = (
@@ -1922,6 +2233,9 @@ def _generate(
     # mid-generation is refused instead of freeing a model that is in use.
     if local:
         _gguf_hold(1)
+    encoder = api_format == FORMAT_CLIP
+    if encoder:
+        _clip_hold(1)
     try:
         describe = local and _as_bool(settings.get("gguf_describe_media")) and bool(media_items)
         described, described_count = "", 0
@@ -1945,10 +2259,14 @@ def _generate(
             return _gguf_generate(
                 settings, system, question, media_parts, should_stop, described, describe, history,
             )
+        if encoder:
+            return _clip_generate(settings, system, question, media_parts, should_stop, history, executing)
         return _http_generate(settings, system, question, media_parts, history)
     finally:
         if local:
             _gguf_hold(-1)
+        if encoder:
+            _clip_hold(-1)
 
 
 def _validate(settings: Mapping[str, Any]) -> str:
@@ -1960,6 +2278,8 @@ def _validate(settings: Mapping[str, Any]) -> str:
         if not str(settings.get("gguf_model") or "").strip():
             return "Select a GGUF model in the settings"
         return ""
+    if api_format == FORMAT_CLIP:
+        return "" if str(settings.get("clip_model") or "").strip() else "Select a text encoder in the settings"
     missing = [
         name for name, key in (("API URL", "api_url"), ("model", "model"), ("API key", "api_key"))
         if not str(settings.get(key) or "").strip()
@@ -2026,6 +2346,17 @@ def _register_routes() -> bool:
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
+    @routes.get(f"{ROUTE_PREFIX}/clip_models")
+    async def _clip_models_get(request):
+        try:
+            return web.json_response({
+                "ok": True,
+                "models": await asyncio.to_thread(_clip_catalog),
+                "roots": _category_paths(CLIP_DIR),
+            })
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
     @routes.post(f"{ROUTE_PREFIX}/unload")
     async def _unload_route(request):
         """Free the model the configured backend is holding.
@@ -2037,10 +2368,12 @@ def _register_routes() -> bool:
         try:
             settings = _read_config()
             api_format = str(settings.get("api_format") or FORMAT_OPENAI).lower()
-            if api_format == FORMAT_GGUF:
+            if api_format in LOCAL_FORMATS:
                 # llm.close() blocks while the weights are freed, so it stays off
                 # the event loop like every other model-touching call here.
-                state = await asyncio.to_thread(_gguf_unload_now)
+                state = await asyncio.to_thread(
+                    _gguf_unload_now if api_format == FORMAT_GGUF else _clip_unload_now,
+                )
                 if state == "busy":
                     return web.json_response(
                         {"ok": False, "busy": True, "error": "A generation is still running"}, status=409,
@@ -2090,8 +2423,9 @@ def _register_routes() -> bool:
                 return web.json_response({"ok": False, "error": problem}, status=400)
             api_format = str(settings.get("api_format") or FORMAT_OPENAI).lower()
             # llama-cpp takes the same OpenAI-shaped image parts as the HTTP
-            # chat-completions format, so the media builder is shared.
-            parts_format = FORMAT_OPENAI if api_format == FORMAT_GGUF else api_format
+            # chat-completions format, so the media builder is shared. The text
+            # encoder backend decodes those parts back into tensors.
+            parts_format = FORMAT_OPENAI if api_format in LOCAL_FORMATS else api_format
             resources = payload.get("resources") if isinstance(payload.get("resources"), list) else []
             items = (
                 await asyncio.to_thread(
@@ -2123,6 +2457,7 @@ def _register_routes() -> bool:
             # Nothing is running in a worker thread at this point, so freeing a
             # model the cancelled run had loaded is safe here.
             _gguf_release()
+            await asyncio.to_thread(_clip_release)
             _log("generation cancelled")
             return web.json_response({"ok": False, "cancelled": True, "error": str(exc)}, status=409)
         except asyncio.CancelledError:
@@ -2161,18 +2496,30 @@ def _register_routes_when_ready() -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _image_input_name(number: int) -> str:
+    """The socket name of image `number` (1-based): `image`, `image2`, …"""
+    return "image" if number <= 1 else f"image{number}"
+
+
 def _execution_media_items(
-    image,
+    images: Mapping[int, Any],
     video,
     api_format: str,
     sample: str = VIDEO_SAMPLE_DEFAULT,
 ) -> list[dict[str, Any]]:
-    """Build request parts from the tensors an execution actually receives."""
+    """Build request parts from the tensors an execution actually receives.
+
+    `images` maps a socket number to its tensor; the tags follow those numbers,
+    the same way the editor tags what it sends.
+    """
     items: list[dict[str, Any]] = []
-    if image is not None:
+    for number in sorted(images):
+        image = images[number]
+        if image is None:
+            continue
         parts = _tensor_still_parts(image, api_format, IMAGE_BATCH_STILLS)
         items.append({
-            "tag": "image 1", "type": "image", "path": "", "parts": parts,
+            "tag": f"image {number}", "type": "image", "path": "", "parts": parts,
             "sampled": len(parts) > 1, "times": [], "duration": 0.0,
         })
     if video is not None:
@@ -2206,7 +2553,7 @@ class LLMWidget:
     # node would be pulled into every queued prompt even when nothing reads its
     # text, which is the opposite of a widget the user keeps muted.
     DESCRIPTION = (
-        "Ask a local or remote LLM a question, optionally about a connected image or video. "
+        "Ask a local or remote LLM a question, optionally about connected images (up to 10) or a video. "
         "Runs from the editor without executing the graph; keep it bypassed or muted."
     )
 
@@ -2232,7 +2579,7 @@ class LLMWidget:
                 "question": ("STRING", {"multiline": True, "default": ""}),
             },
             "optional": {
-                "image": ("IMAGE",),
+                **{_image_input_name(number): ("IMAGE",) for number in range(1, IMAGE_INPUT_MAX + 1)},
                 "video": ("VIDEO",),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
@@ -2243,8 +2590,9 @@ class LLMWidget:
         return float("nan")
 
     # ComfyUI calls this with keyword arguments, so the order here is only for
-    # reading; it follows INPUT_TYPES.
-    def run(self, system_prompt, generate_on_execute, answer, question, image=None, video=None, unique_id=None):
+    # reading; it follows INPUT_TYPES. The image sockets arrive in `images`
+    # under their socket names, and only the connected ones are in it.
+    def run(self, system_prompt, generate_on_execute, answer, question, video=None, unique_id=None, **images):
         stored = str(answer or "")
         # Downstream wants the reply, never the log around it, so the widget is
         # reduced to its last `<llm>` block. Without continue mode there are no
@@ -2263,12 +2611,15 @@ class LLMWidget:
         if not str(question or "").strip():
             raise ValueError("Type a question first")
         api_format = str(settings.get("api_format") or FORMAT_OPENAI).lower()
-        parts_format = FORMAT_OPENAI if api_format == FORMAT_GGUF else api_format
+        parts_format = FORMAT_OPENAI if api_format in LOCAL_FORMATS else api_format
+        connected = {
+            number: images.get(_image_input_name(number)) for number in range(1, IMAGE_INPUT_MAX + 1)
+        }
         items = (
-            _execution_media_items(image, video, parts_format, str(settings.get("video_sample") or ""))
+            _execution_media_items(connected, video, parts_format, str(settings.get("video_sample") or ""))
             if _as_bool(settings.get("read_media"), True) else []
         )
-        text = _generate(settings, str(system_prompt or ""), str(question), items, None, stored)
+        text = _generate(settings, str(system_prompt or ""), str(question), items, None, stored, executing=True)
         # The editor gets the widget's new contents — the whole log in continue
         # mode — while the output socket carries the reply on its own.
         _notify_answer(

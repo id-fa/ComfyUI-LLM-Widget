@@ -41,6 +41,11 @@ handler がなくても動きますが、その場合はテキストだけを見
 PyTorch のインデックスと上記リポジトリのリリース資産を確認したうえで、指定した環境に対する
 `pip install` の行をそのまま出力します。すでに最新であればその旨を表示します。
 
+> **このスクリプトは `git clone` した場合にだけ入っています。** Comfy Registry（ComfyUI-Manager や
+> `comfy node install`）経由のパッケージからは除外してあるため、そちらでインストールした場合は
+> `tools/` フォルダごと存在しません。必要なら、このリポジトリから `tools/install_helper.py` だけを
+> 取得して実行してください。標準ライブラリだけで動き、ノード本体はこのファイルに依存しません。
+
 ```bat
 python tools\install_helper.py --python "C:\AI\ComfyUI\python_embeded\python.exe"
 ```
@@ -77,7 +82,7 @@ C:\AI\ComfyUI\python_embeded\python.exe -c "from llama_cpp.llama_chat_format imp
 
 | スロット | 型 | 備考 |
 | --- | --- | --- |
-| `image`（入力） | `IMAGE` | 任意 |
+| `image`, `image2` … `image10`（入力） | `IMAGE` | 任意。モデルには **スロット番号** で `image 1` … `image 10` として渡ります（`image2` を空けても `image3` は `image 3` のまま）。複数の参照画像を番号で指す編集モデル向けのプロンプトを書かせるときは、その番号で質問してください |
 | `video`（入力） | `VIDEO` | 任意 |
 | `text`（出力） | `STRING` | 任意 — 通常は未使用。*実行時の動作* を参照 |
 
@@ -146,7 +151,7 @@ Reroute ノードは辿って追跡します。
 
 | 設定 | 対象 | 意味 |
 | --- | --- | --- |
-| API format | 全て | `OpenAI-compatible`、`Gemini`、`GGUF` |
+| API format | 全て | `OpenAI-compatible`、`Gemini`、`GGUF`、`ComfyUI text encoder` |
 | API URL | openai / gemini | パスは自動補完されます。`http://host:1234`、`.../v1`、完全な `/v1/chat/completions` のいずれでも可 |
 | API key | openai / gemini | `Authorization: Bearer` / `x-goog-api-key` として送信 |
 | Model | openai / gemini | Gemini では id 単体、`models/<id>`、モデルの完全な URL のいずれでも可 |
@@ -154,16 +159,40 @@ Reroute ノードは辿って追跡します。
 | Vision projector | gguf | `auto` はモデルの隣の最初の `mmproj*.gguf` を使用。`none` はテキストのみに固定 |
 | Context size | gguf | `n_ctx` |
 | GPU layers | gguf | `n_gpu_layers`。`-1` で全レイヤーをオフロード |
+| Text encoder | clip | `models/text_encoders` の `.safetensors` — *ComfyUI のテキストエンコーダを LLM として使う* を参照 |
 | Model thinking | 全て | `Off`（既定）または `Keep` — *推論（thinking）* を参照 |
 | Temperature | 全て | |
 | Max answer tokens | 全て | ローカルバックエンドでは `max_tokens`。答えの長さの上限 |
 | Continue the conversation | 全て | 前回までのやり取りも一緒に送ります — *会話を続ける* を参照 |
 | Exchanges kept in the history | 全て | 送るやり取りの上限（新しい方から数えて何往復ぶんか） |
 | Blank line between the log entries | 全て | ログの各ブロックの間に空行を入れるか。オフで詰めた IRC ログになります |
-| Unload after answering | gguf | モデルを常駐させず、すぐに VRAM を解放。オフのままでもツールバーの ⏏ でいつでも解放できます |
+| Unload after answering | gguf / clip | モデルを常駐させず、すぐに VRAM を解放。オフのままでもツールバーの ⏏ でいつでも解放できます |
 | Send the connected image / video | 全て | オフにすると質問は純粋なテキストとして送られます |
 | Video frames sent | 全て | 動画 1 本を何枚の静止画にするか（2〜12、既定 4）。Gemini はファイルをそのまま送るため無関係です |
 | Describe each media in its own pass | gguf | 下記参照 |
+
+### ComfyUI のテキストエンコーダを LLM として使う
+
+API format を `ComfyUI text encoder (safetensors)` にすると、`models/text_encoders` にある ComfyUI 形式の
+`.safetensors` をそのまま LLM として動かします。llama-cpp-python も mmproj も要りません。たとえば
+Qwen-Image 2.1 のテキストエンコーダは Qwen3-VL-8B そのものなので、画像生成用に既に持っているファイルで
+プロンプトを書かせられます。ComfyUI 本体の `Generate Text` ノードと同じ仕組み（`CLIP.generate`）ですが、
+グラフを実行せずに ✦ から動き、system prompt・会話の履歴・複数の画像がそのまま使えます。
+
+- 対応するのは **LLM ベースのエンコーダ** だけです（Qwen3-VL、Qwen3.5、Gemma など）。CLIP-L や T5 は
+  文章を生成できないので、選ぶとエラーになります。
+- system prompt と履歴と複数サイズの画像をチャットとして渡せるのは Qwen3-VL / Qwen3.5 系です。それ以外は
+  ComfyUI 内蔵の 1 ターン用テンプレートに頼るため、system prompt と履歴は質問文の中に畳み込まれ、画像は
+  1 枚目の大きさに揃えられます。
+- `lm_head` を削って配布されているファイルでは意味のある文章になりません。その場合は完全な重みのものを
+  使ってください。
+- **ワークフローの実行中は断ります。** ComfyUI のモデル管理にはロックが無く、実行中のグラフと同時に
+  モデルを出し入れすると VRAM の管理が競合するためです。逆に、生成中にワークフローをキューするのも
+  避けてください。
+- ワークフロー側の CLIP Loader とは別に読み込みます。VRAM が足りなくなれば ComfyUI が通常どおり
+  退避させますが、すぐ空けたいときは ⏏ か `Unload after answering` を使ってください。
+- 画像は長辺 1024px に縮めてから渡します（1 枚あたりおよそ 1000 トークン）。
+- ■ で停止できます（トークン単位。モデルの読み込み中と最初のプロンプト評価中は止まりません）。
 
 ### 会話を続ける（continue モード）
 
@@ -355,6 +384,11 @@ one the model still answers, from the text alone.
 the PyTorch index and the release assets of that repository, and prints the exact
 `pip install` line for the environment you point it at — or tells you it is already current.
 
+> **This script only comes with a `git clone`.** It is excluded from the Comfy Registry package
+> (ComfyUI-Manager, `comfy node install`), so an install made that way has no `tools/` folder at
+> all. If you need it, fetch `tools/install_helper.py` from this repository on its own and run it:
+> it uses nothing but the standard library, and the node itself does not depend on it.
+
 ```bat
 python tools\install_helper.py --python "C:\AI\ComfyUI\python_embeded\python.exe"
 ```
@@ -390,7 +424,7 @@ it back with `pip install --upgrade "numpy<2.3"` (same idea for `"pillow<12"`).
 
 | Slot | Type | Notes |
 | --- | --- | --- |
-| `image` (input) | `IMAGE` | optional |
+| `image`, `image2` … `image10` (input) | `IMAGE` | optional. The model receives them as `image 1` … `image 10` by **socket number** (`image3` stays `image 3` with `image2` left empty), so refer to them by that number when asking for a prompt for a multi-reference edit model |
 | `video` (input) | `VIDEO` | optional |
 | `text` (output) | `STRING` | optional — normally unused, see *Execution* |
 
@@ -458,7 +492,7 @@ API key** and is gitignored.
 
 | Setting | Applies to | Meaning |
 | --- | --- | --- |
-| API format | all | `OpenAI-compatible`, `Gemini`, or `GGUF` |
+| API format | all | `OpenAI-compatible`, `Gemini`, `GGUF`, or `ComfyUI text encoder` |
 | API URL | openai / gemini | The path is completed for you: `http://host:1234` , `.../v1` and a full `/v1/chat/completions` all work |
 | API key | openai / gemini | Sent as `Authorization: Bearer` / `x-goog-api-key` |
 | Model | openai / gemini | For Gemini a bare id, `models/<id>` or a full model URL are all accepted |
@@ -466,16 +500,41 @@ API key** and is gitignored.
 | Vision projector | gguf | `auto` picks the first `mmproj*.gguf` next to the model; `none` forces text-only |
 | Context size | gguf | `n_ctx` |
 | GPU layers | gguf | `n_gpu_layers`, `-1` offloads everything |
+| Text encoder | clip | A `.safetensors` under `models/text_encoders` — see *Using a ComfyUI text encoder as the LLM* |
 | Model thinking | all | `Off` (default) or `Keep` — see *Reasoning* |
 | Temperature | all | |
 | Max answer tokens | all | `max_tokens` for the local backends, the answer length cap |
 | Continue the conversation | all | Send the earlier turns along with the question — see *Continuing the conversation* |
 | Exchanges kept in the history | all | How many of the most recent exchanges are replayed |
 | Blank line between the log entries | all | Whether the log's blocks are separated by a blank line. Off gives a tight IRC log |
-| Unload after answering | gguf | Frees VRAM immediately instead of keeping the model resident. Leave it off and use the toolbar's ⏏ when you want the VRAM back |
+| Unload after answering | gguf / clip | Frees VRAM immediately instead of keeping the model resident. Leave it off and use the toolbar's ⏏ when you want the VRAM back |
 | Send the connected image / video | all | Off means the question is asked as pure text |
 | Video frames sent | all | How many stills one video becomes (2–12, default 4). Not used by Gemini, which gets the file whole |
 | Describe each media in its own pass | gguf | See below |
+
+### Using a ComfyUI text encoder as the LLM
+
+With the API format set to `ComfyUI text encoder (safetensors)`, a `.safetensors` in ComfyUI's own
+format under `models/text_encoders` is run as the LLM — no llama-cpp-python, no mmproj. The text
+encoder of Qwen-Image 2.1 *is* Qwen3-VL-8B, for one, so the file you already have for generating
+images can write their prompts. It is the mechanism behind ComfyUI's own `Generate Text` node
+(`CLIP.generate`), but it runs from ✦ without executing the graph, and the system prompt, the
+conversation history and several images all work.
+
+- Only **LLM-based encoders** can do this (Qwen3-VL, Qwen3.5, Gemma, …). A CLIP-L or a T5 cannot
+  generate text and is refused.
+- Qwen3-VL / Qwen3.5 get a real chat: system prompt, earlier turns, images of any mix of sizes.
+  Every other family only has ComfyUI's built-in single-turn template, so the system prompt and the
+  history are folded into the question and the images are resized to match the first one.
+- A file distributed without its `lm_head` will not produce meaningful text; use one with the full
+  weights.
+- **It is refused while a workflow is running.** ComfyUI's model management has no lock, and moving
+  a model in and out next to an executing graph races over the same VRAM bookkeeping. For the same
+  reason, do not queue a workflow while an answer is being generated.
+- It is loaded separately from the workflow's CLIP Loader. ComfyUI offloads it as usual when VRAM
+  runs short; use ⏏ or `Unload after answering` to get the memory back right away.
+- Images are shrunk to 1024px on the long side first (about a thousand tokens each).
+- ■ stops it, token by token (not during model loading or the first prompt evaluation).
 
 ### Continuing the conversation
 

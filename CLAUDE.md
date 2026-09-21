@@ -11,7 +11,7 @@ answer on the node.
 There is no build system, no test suite, no linter, and `dependencies = []` in `pyproject.toml`.
 Two source files:
 
-- `nodes.py` — settings file, URL normalization, the OpenAI/Gemini/GGUF backends, the media
+- `nodes.py` — settings file, URL normalization, the OpenAI/Gemini/GGUF/text-encoder backends, the media
   resolution, the HTTP routes, and the node class.
 - `web/llm_widget_ui.js` — the toolbar DOM widget, the settings dialog, link tracing, and the
   fetch/cancel plumbing.
@@ -53,6 +53,15 @@ with nothing queued. That is why:
 3. The `{filename, subfolder, storage}` descriptor is POSTed as `resources`.
 4. Python `_asset_path` re-resolves it under `input/`/`output/`/`temp/` **with a realpath prefix
    check** — keep that check when touching this. A path that escapes those roots returns `None`.
+
+There are `IMAGE_INPUT_MAX` image sockets — `image`, `image2` … `image10`; the first keeps its old
+name so workflows saved with one socket still connect — and one `video`. **A tag is the socket
+number, not the rank among the connected ones**: with `image2` empty, `image3` is still sent as
+`image 3`, because multi-reference edit models (Qwen-Image) address their inputs by number and the
+prompt being written has to use the same numbers. The JS `MEDIA_INPUTS` table and Python
+`_execution_media_items` both tag this way; `_media_items` only falls back to counting when a
+resource arrives without a tag. The chips are one row that scrolls sideways, like the tab strip,
+so eleven of them do not change the toolbar height.
 
 An unresolvable media is *kept* as an item with empty `parts` so the run can report what it
 skipped (`skipped` in the response, red struck-through chip in the toolbar) rather than silently
@@ -106,6 +115,38 @@ already-resolved `media_items`, so neither caller knows about the other's media 
   Every other `_gguf_release` call site already runs after the run unwound.
 - llama-cpp takes the same OpenAI-shaped `image_url` parts, so the media builders are shared and
   the GGUF path passes `FORMAT_OPENAI` as its `parts_format`.
+
+- **clip** (`_clip_generate`) — a text encoder in ComfyUI's safetensors format run as the LLM
+  through comfy's own `comfy.sd.load_clip` → `clip.tokenize` → `clip.generate` → `clip.decode`,
+  the path behind core's `Generate Text` node (`comfy_extras/nodes_textgen.py` is the reference).
+  It exists because the encoder of Qwen-Image 2.1 *is* Qwen3-VL-8B. Things that are not obvious:
+  - **No `clip_type` is passed to `load_clip`.** A type selects an image model's conditioning
+    variant of the encoder; the untyped default is the generic wrapper, and that is the one built
+    to generate.
+  - **The prompt is a hand-built ChatML string** for the families in `_CLIP_CHATML_FAMILIES`
+    (matched on `clip.tokenizer.clip_name`). comfy's Qwen tokenizers skip their single-turn
+    template for a text that starts with `<|im_start|>` and replace each `<|image_pad|>` with the
+    next entry of `images=[…]`, which is the only way a system prompt, the history and images of
+    different sizes get in. The dict value is the closed `<think>` block that family reads as
+    thinking-off — the spacing differs between Qwen3-VL and Qwen3.5 and is copied from their
+    tokenizers. Any other family falls back to comfy's template: everything folded into the user
+    text, images resized to one size because `image=` is a single batch.
+  - The media pipeline is not forked: the backend takes the same OpenAI-shaped `parts`
+    (`LOCAL_FORMATS` → `FORMAT_OPENAI`) and `_clip_image_tensors` decodes them back, capped at
+    `CLIP_IMAGE_MAX_SIDE` because comfy's Qwen preprocessor would keep up to 12.8 MP.
+  - **`generate` takes no stop callback.** It ticks a `comfy.utils.ProgressBar`, so
+    `_clip_cancel_hook` swaps `PROGRESS_BAR_HOOK` for the duration, polling the cancel registry
+    *on the owning thread only* and forwarding every other thread to the server's hook. The
+    server's hook is deliberately not called for this run — it reports to `last_node_id`. During
+    `generate_on_execute` no hook is installed and comfy's own interrupt applies.
+  - **The route refuses while a workflow is running** (`_clip_workflow_running`): comfy's model
+    management has no lock, and `load_models_gpu` from a worker thread next to the executor races
+    over the same bookkeeping. `executing=True` from `LLMWidget.run` skips the check, because
+    there the caller *is* the executor. Both callers wrap the run in `torch.inference_mode()`, as
+    the executor does, so the cached model is usable from either.
+  - `_CLIP_STATE` / `_clip_hold` / `_clip_unload_now` mirror the GGUF trio. Release goes through
+    `unload_model_and_clones`; dropping the reference alone leaves the weights on the GPU.
+  - There is no describe mode and no mmproj here; do not port them.
 
 `gguf_describe_media` switches to a two-stage shape: `_gguf_describe` runs one small vision pass
 per media, then `_gguf_generate` gets the descriptions as `context` and no images. It exists
@@ -281,8 +322,9 @@ node.properties["llmw_system_tab_index"] = open tab
 `SAVED_WIDGETS` in the JS must list the widgets of `INPUT_TYPES` in the same order.
 
 Constants duplicated between `nodes.py` and `web/llm_widget_ui.js` must be edited in both: the
-route paths under `/llm_widget/`, `ANSWER_EVENT`, the three format ids, `GGUF_MMPROJ_AUTO` /
-`GGUF_MMPROJ_NONE`, `CHAT_USER_MARK` / `CHAT_MODEL_MARK`, the `VIDEO_SAMPLES` ids, and every
+route paths under `/llm_widget/`, `ANSWER_EVENT`, the four format ids and `LOCAL_FORMATS`, `GGUF_MMPROJ_AUTO` /
+`GGUF_MMPROJ_NONE`, `CHAT_USER_MARK` / `CHAT_MODEL_MARK`, the `VIDEO_SAMPLES` ids, `IMAGE_INPUT_MAX` with the socket
+naming (`image`, `image2`, …), and every
 settings key with its clamp range (both sides normalize independently, and the server's
 normalization is authoritative).
 
