@@ -1,7 +1,7 @@
 [project]
 name = "llm-widget"
 description = "A standalone LLM widget node for ComfyUI: ask a local CLIP/GGUF or an OpenAI/Gemini-compatible API a question about a connected image or video, without running the graph."
-version = "0.2.1"
+version = "0.2.2"
 license = { file = "LICENSE" }
 dependencies = []
 

@@ -2037,12 +2037,73 @@ _CLIP_LOCK = threading.RLock()
 _CLIP_STATE: dict[str, Any] = {"path": None, "clip": None}
 # Same reason as _GGUF_BUSY: ⏏ must not take the weights from under a run.
 _CLIP_BUSY = 0
+# The request id of the editor-route run that is generating right now, so the
+# cancel route can tell whether comfy's interrupt flag would stop *our* run.
+_CLIP_ACTIVE_REQUEST = ""
 
 
 def _clip_hold(delta: int) -> None:
     global _CLIP_BUSY
     with _CLIP_LOCK:
         _CLIP_BUSY = max(0, _CLIP_BUSY + delta)
+
+
+def _clip_set_active(request_id: str) -> None:
+    global _CLIP_ACTIVE_REQUEST
+    with _CLIP_LOCK:
+        _CLIP_ACTIVE_REQUEST = str(request_id or "")
+
+
+def _clip_interrupt(request_id: str) -> bool:
+    """Stop the editor-route text encoder run `request_id` through comfy's own interrupt.
+
+    Every op the encoder runs calls `throw_exception_if_processing_interrupted`,
+    so this stops the generation at the next kernel — the progress-bar hook only
+    hears from `ProgressBar` every 0.5 % of the budget, which at a few seconds a
+    token is minutes. The flag is global, so it is only raised while no workflow
+    is executing (the route refused to start next to one, but one may have been
+    queued since) — a workflow resets it at its own start anyway.
+    """
+    with _CLIP_LOCK:
+        if not request_id or request_id != _CLIP_ACTIVE_REQUEST:
+            return False
+    if _clip_workflow_running():
+        return False
+    try:
+        import comfy.model_management
+
+        comfy.model_management.interrupt_current_processing(True)
+    except Exception as exc:
+        logging.warning(LOG_PREFIX + "could not interrupt the text encoder (%s).", exc)
+        return False
+    return True
+
+
+def _clip_after_generate() -> None:
+    """What the executor does after every node, for a `generate` that was not one.
+
+    A Qwen3 encoder decodes through per-layer CUDA graphs that
+    `comfy.model_prefetch` captures on the first decode step and replays for as
+    long as the layer's weights sit in the same VRAM block. Nothing else is
+    compared, so the *second* `generate()` on a loaded model replays graphs that
+    write into the first call's KV cache — freed by then — and the scatter into
+    it dies with a device-side assert that takes the whole process down.
+    `execution.py` drops the graphs in the `finally` of each node; the editor
+    route is not a node and the model stays loaded between ✦ presses, so this
+    backend drops them itself after every call. Cheap when there is nothing to
+    drop, and harmless during execution, where the executor drops them again.
+    """
+    try:
+        import comfy.model_prefetch
+    except Exception:
+        return
+    cleanup = getattr(comfy.model_prefetch, "cleanup_prefetch_queues", None)
+    if cleanup is None:
+        return
+    try:
+        cleanup()
+    except Exception as exc:
+        logging.warning(LOG_PREFIX + "could not drop the text encoder's decode graphs (%s).", exc)
 
 
 def _clip_catalog() -> list[str]:
@@ -2252,8 +2313,10 @@ def _clip_generate(
     should_stop=None,
     history: Sequence[Mapping[str, str]] | None = None,
     executing: bool = False,
+    request_id: str = "",
 ) -> str:
     """Run the question through a ComfyUI text encoder and return the answer."""
+    import comfy.model_management
     import torch
 
     # comfy's model management has no lock of its own: loading a model from
@@ -2261,10 +2324,17 @@ def _clip_generate(
     # same VRAM bookkeeping. Inside an execution this *is* the executor.
     if not executing and _clip_workflow_running():
         raise ValueError("ComfyUI is running a workflow. Ask again when it has finished.")
+    if not executing:
+        # ComfyUI's Cancel button sets this flag even when nothing is running,
+        # and it then stays up until the next workflow resets it — or until our
+        # first kernel trips over it. Nothing is running (checked above), so it
+        # is stale. Inside an execution the flag belongs to the executor.
+        comfy.model_management.interrupt_current_processing(False)
     started = time.perf_counter()
     max_tokens = int(settings.get("max_length") or MAX_LENGTH_DEFAULT)
     temperature = float(settings.get("temperature", CONFIG_DEFAULTS["temperature"]))
     no_think = str(settings.get("thinking") or THINKING_OFF).lower() != THINKING_KEEP
+    _clip_set_active("" if executing else request_id)
     try:
         # The executor runs nodes under inference_mode, and a model loaded under
         # one mode is not usable under the other, so both callers use it.
@@ -2280,16 +2350,33 @@ def _clip_generate(
                 len(history or []), max_tokens, "off" if no_think else "kept",
             )
             tokens = _clip_tokens(clip, system_prompt, user_prompt, images, no_think, history)
-            with _clip_cancel_hook(should_stop):
-                ids = clip.generate(
-                    tokens, do_sample=temperature > 0.0, max_length=max_tokens, temperature=max(temperature, 0.01),
-                    top_k=64, top_p=0.95, min_p=0.05, repetition_penalty=1.05, seed=0,
-                )
+            try:
+                with _clip_cancel_hook(should_stop):
+                    ids = clip.generate(
+                        tokens, do_sample=temperature > 0.0, max_length=max_tokens,
+                        temperature=max(temperature, 0.01), top_k=64, top_p=0.95, min_p=0.05,
+                        repetition_penalty=1.05, seed=0,
+                    )
+            finally:
+                _clip_after_generate()
             raw = clip.decode(ids)
+    except comfy.model_management.InterruptProcessingException as exc:
+        # A BaseException, so the route's `except Exception` never sees it.
+        # During execution it is the workflow being cancelled and belongs to
+        # the executor. From the editor, our own ■ raises it through
+        # `_clip_interrupt`; anything else is ComfyUI's Cancel button pressed
+        # during the run.
+        if executing:
+            raise
+        _clip_release()
+        if should_stop is not None and should_stop():
+            raise _Cancelled("Generation was cancelled") from exc
+        raise ValueError("ComfyUI's interrupt stopped the text encoder. Press ✦ again.") from exc
     except _Cancelled:
         _clip_release()
         raise
     finally:
+        _clip_set_active("")
         if _as_bool(settings.get("clip_unload_after")):
             _clip_release()
     text = _clean_output(raw, no_think)
@@ -2317,6 +2404,7 @@ def _generate(
     should_stop=None,
     transcript: str = "",
     executing: bool = False,
+    request_id: str = "",
 ) -> str:
     """Run one question through the configured backend.
 
@@ -2324,7 +2412,8 @@ def _generate(
     editor route (file paths) and node execution (tensors). `transcript` is the
     raw answer widget; parsing it here means the log the user sees is the only
     definition of what the conversation is. `executing` says the caller is the
-    graph executor, which only the text encoder backend needs to know.
+    graph executor, which only the text encoder backend needs to know, as is
+    `request_id`, which lets the cancel route interrupt that backend's run.
     """
     api_format = str(settings.get("api_format") or FORMAT_OPENAI).lower()
     history = (
@@ -2363,7 +2452,9 @@ def _generate(
                 settings, system, question, media_parts, should_stop, described, describe, history,
             )
         if encoder:
-            return _clip_generate(settings, system, question, media_parts, should_stop, history, executing)
+            return _clip_generate(
+                settings, system, question, media_parts, should_stop, history, executing, request_id,
+            )
         return _http_generate(settings, system, question, media_parts, history)
     finally:
         if local:
@@ -2532,6 +2623,10 @@ def _register_routes() -> bool:
             if not _cancel(request_id):
                 return web.json_response({"ok": False, "error": "A request id is required"}, status=400)
             _log("cancel requested for %s", request_id)
+            # The GGUF loop polls the registry between tokens; a text encoder
+            # run is stopped through comfy's interrupt, which its next op checks.
+            if _clip_interrupt(request_id):
+                _log("interrupting the text encoder")
             return web.json_response({"ok": True})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
@@ -2573,7 +2668,7 @@ def _register_routes() -> bool:
             should_stop = (lambda: _is_cancelled(request_id)) if request_id else None
             _raise_if_cancelled(request_id)
             answer = await asyncio.to_thread(
-                _generate, settings, system, question, items, should_stop, transcript,
+                _generate, settings, system, question, items, should_stop, transcript, False, request_id,
             )
             # An HTTP request cannot be interrupted mid-flight, so a late cancel
             # is honoured by throwing the answer away.

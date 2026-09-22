@@ -192,7 +192,14 @@ Qwen-Image 2.1 のテキストエンコーダは Qwen3-VL-8B そのものなの�
 - ワークフロー側の CLIP Loader とは別に読み込みます。VRAM が足りなくなれば ComfyUI が通常どおり
   退避させますが、すぐ空けたいときは ⏏ か `Unload after answering` を使ってください。
 - 画像は長辺 1024px に縮めてから渡します（1 枚あたりおよそ 1000 トークン）。
-- ■ で停止できます（トークン単位。モデルの読み込み中と最初のプロンプト評価中は止まりません）。
+- ■ で停止できます。ComfyUI 自身の Cancel と同じ割り込みフラグを使うので、次のカーネルで
+  止まります（ワークフローの実行中はフラグが共有のため立てません）。停止するとエンコーダは
+  解放されます。
+- Qwen3 系のエンコーダは、ComfyUI が最初の生成で捕捉した CUDA graph でデコードします。本体は
+  ノードの実行が終わるたびにそれを捨てますが、✦ はノードではなくモデルも常駐したままなので、
+  このパックが生成のたびに自分で捨てています。これが無いと 2 回目の ✦ が 1 回目の解放済み KV
+  キャッシュに書き込み、ComfyUI 全体が `scatter gather kernel index out of bounds` で落ちます。
+  このメッセージが出たらメモリ不足ではありません。報告してください。
 
 ### 会話を続ける（continue モード）
 
@@ -534,7 +541,15 @@ conversation history and several images all work.
 - It is loaded separately from the workflow's CLIP Loader. ComfyUI offloads it as usual when VRAM
   runs short; use ⏏ or `Unload after answering` to get the memory back right away.
 - Images are shrunk to 1024px on the long side first (about a thousand tokens each).
-- ■ stops it, token by token (not during model loading or the first prompt evaluation).
+- ■ stops it the way ComfyUI's own Cancel button would, through the interrupt flag every kernel
+  checks — only while no workflow is running, since the flag is global. Stopping releases the
+  encoder.
+- A Qwen3 encoder decodes through CUDA graphs that ComfyUI captures on the first generation and
+  normally discards after each node. ✦ is not a node and the model stays loaded between presses,
+  so this pack discards them itself after every generation — without that, the second ✦ writes
+  into the first one's freed KV cache and the whole ComfyUI process aborts with
+  `scatter gather kernel index out of bounds`. If you ever see that message, it is not
+  out-of-memory; report it.
 
 ### Continuing the conversation
 
