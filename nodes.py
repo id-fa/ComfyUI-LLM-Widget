@@ -18,6 +18,7 @@ import asyncio
 import base64
 import contextlib
 import hmac
+import inspect
 import io
 import ipaddress
 import json
@@ -156,6 +157,15 @@ DESCRIBE_THINKING_HEADROOM = 768
 # and the same request has to keep working for the models that only read the
 # older switch.
 REASONING_EFFORT = "low"
+# Prepended to a GGUF's own chat template when this widget renders it itself. A
+# top-level `set` shadows the render context, so the switches reach the template
+# on every llama-cpp-python build - including 0.4.x, whose
+# `create_chat_completion` has a fixed signature with no `chat_template_kwargs`
+# at all, so the same values passed as an argument never got anywhere.
+GGUF_TEMPLATE_PREFIX = (
+    "{%- set enable_thinking = false -%}"
+    "{%- set reasoning_effort = " + json.dumps(REASONING_EFFORT) + " -%}"
+)
 DESCRIBE_SYSTEM = (
     "You describe one piece of media so another model can reason about it from your words alone.\n"
     "Report only what is actually present: subject, appearance, clothing, pose, setting, lighting, "
@@ -1608,50 +1618,230 @@ def _is_gemma_name(model_name: str) -> bool:
     return "gemma" in os.path.basename(str(model_name or "")).lower()
 
 
+# Qwen3.5 and later pre-open `<think>` in the assistant turn unless the template
+# is told `enable_thinking=false`. The Qwen3-VL handler's template has no such
+# switch, so a 3.5 model rendered through it simply thinks - through the whole
+# answer budget - which is how "qwen3.5" matching "qwen3" cost 8192 tokens of
+# reasoning and no answer. The dot is required: "qwen3-8b" is Qwen3.
+_QWEN35_NAME_RE = re.compile(r"qwen3\.[5-9]")
+
+
+def _gguf_handler_candidates(model_name: str) -> tuple[str, ...]:
+    lowered = os.path.basename(model_name).lower().replace("_", "-")
+    if "gemma" in lowered:
+        return ("Gemma4ChatHandler", "Gemma3ChatHandler")
+    if _QWEN35_NAME_RE.search(lowered):
+        return ("Qwen35ChatHandler", "Qwen3VLChatHandler", "Qwen25VLChatHandler")
+    if "qwen3" in lowered:
+        return ("Qwen3VLChatHandler", "Qwen25VLChatHandler")
+    if "qwen" in lowered:
+        return ("Qwen25VLChatHandler", "Qwen3VLChatHandler")
+    if "minicpm" in lowered:
+        return ("MiniCPMv26ChatHandler", "Llava15ChatHandler")
+    return ("Llava16ChatHandler", "Llava15ChatHandler")
+
+
+def _gguf_handler_modules() -> list[Any]:
+    """Where the installed llama-cpp-python keeps its vision chat handlers.
+
+    0.4.x moved them to `llama_multimodal` and only re-exports them from
+    `llama_chat_format`; older builds have them in `llama_chat_format` alone.
+    """
+    modules: list[Any] = []
+    try:
+        from llama_cpp import llama_multimodal
+
+        modules.append(llama_multimodal)
+    except Exception:
+        pass
+    from llama_cpp import llama_chat_format
+
+    modules.append(llama_chat_format)
+    return modules
+
+
 def _gguf_chat_handler(model_name: str, mmproj_path: str):
     """Pick the llama_cpp vision handler that matches the model family.
 
     Handler classes differ between llama-cpp-python builds and forks, so the
     candidates are tried in order and a missing one is simply skipped.
-    """
-    lowered = os.path.basename(model_name).lower().replace("_", "-")
-    if "gemma" in lowered:
-        candidates = ("Gemma4ChatHandler", "Gemma3ChatHandler")
-    elif "qwen3" in lowered:
-        candidates = ("Qwen3VLChatHandler", "Qwen25VLChatHandler")
-    elif "qwen" in lowered:
-        candidates = ("Qwen25VLChatHandler", "Qwen3VLChatHandler")
-    elif "minicpm" in lowered:
-        candidates = ("MiniCPMv26ChatHandler", "Llava15ChatHandler")
-    else:
-        candidates = ("Llava16ChatHandler", "Llava15ChatHandler")
-    from llama_cpp import llama_chat_format
 
-    for name in (*candidates, "Llava15ChatHandler"):
-        handler = getattr(llama_chat_format, name, None)
+    A vision handler renders its *own* chat template, so nothing sent with the
+    request (`chat_template_kwargs`, `/no_think`) can switch reasoning off on
+    that path - only a constructor argument can. Whichever switch the class
+    declares (`enable_thinking` on the 0.4.x handlers, `force_reasoning` on the
+    older Qwen ones) is passed as False; `_gguf_set_handler_thinking` flips the
+    former back on for a turn with **Model thinking = Keep**. A class that
+    declares neither has no switch, and the describe pass then lives on its
+    token headroom.
+    """
+    modules = _gguf_handler_modules()
+    for name in (*_gguf_handler_candidates(model_name), "Llava15ChatHandler"):
+        handler = next((getattr(module, name) for module in modules if getattr(module, name, None) is not None), None)
         if handler is None:
             continue
-        kwargs: dict[str, Any] = {"clip_model_path": mmproj_path, "verbose": False}
-        # Qwen-style handlers reason by default; the widget only wants the
-        # answer. Gemma's handler rejects the flag, and older builds of the
-        # others do not know it either, hence the retry without it.
-        if not _is_gemma_name(model_name):
-            kwargs["force_reasoning"] = False
         try:
-            return handler(**kwargs)
-        except TypeError:
-            kwargs.pop("force_reasoning", None)
+            params = inspect.signature(handler.__init__).parameters
+        except (TypeError, ValueError):
+            params = {}
+        switches = {key: False for key in ("enable_thinking", "force_reasoning") if key in params}
+        # `mmproj_path` is the 0.4.x name, `clip_model_path` the older one (still
+        # accepted as an alias, with a deprecation line on stderr).
+        attempts: list[dict[str, Any]] = [
+            {"mmproj_path": mmproj_path, "verbose": False, **switches},
+            {"clip_model_path": mmproj_path, "verbose": False, **switches},
+        ]
+        if switches:
+            attempts.append({"clip_model_path": mmproj_path, "verbose": False})
+        for kwargs in attempts:
             try:
-                return handler(**kwargs)
+                instance = handler(**kwargs)
+            except TypeError:
+                continue
             except Exception as exc:
                 logging.warning(LOG_PREFIX + "%s could not load the vision projector (%s).", name, exc)
-        except Exception as exc:
-            logging.warning(LOG_PREFIX + "%s could not load the vision projector (%s).", name, exc)
+                break
+            used = [key for key in switches if key in kwargs]
+            _log("vision chat handler %s (%s)", name, f"{used[0]}=False" if used else "no thinking switch in this build")
+            return instance
     return None
 
 
+def _gguf_set_handler_thinking(llm, enabled: bool) -> None:
+    """Flip a 0.4.x vision handler's `enable_thinking` for the next turn.
+
+    The handlers read the flag at call time (`Gemma4ChatHandler` copies
+    `self.enable_thinking` into the template arguments on every call,
+    `Qwen35ChatHandler` keeps it in `extra_template_arguments`), so the one
+    constructed with it off can still honour **Model thinking = Keep**. Older
+    handlers with `force_reasoning` bake it into the constructor and are left
+    alone, as before.
+    """
+    handler = getattr(llm, "chat_handler", None)
+    if handler is None or not hasattr(handler, "enable_thinking"):
+        return
+    try:
+        handler.enable_thinking = bool(enabled)
+        extra = getattr(handler, "extra_template_arguments", None)
+        if isinstance(extra, dict) and "enable_thinking" in extra:
+            extra["enable_thinking"] = bool(enabled)
+    except Exception:
+        pass
+
+
+def _gguf_template(llm) -> str:
+    metadata = getattr(llm, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return ""
+    return str(metadata.get("tokenizer.chat_template") or "")
+
+
+def _gguf_token_text(llm, token_id: Any) -> str:
+    """The text of one special token, the way the chat template spells it."""
+    try:
+        token = int(token_id)
+    except (TypeError, ValueError):
+        return ""
+    if token < 0:
+        return ""
+    getter = getattr(getattr(llm, "_model", None), "token_get_text", None)
+    if callable(getter):
+        try:
+            return str(getter(token) or "")
+        except Exception:
+            pass
+    # `special=False` renders a special token as nothing, so ask for it.
+    for kwargs in ({"special": True}, {}):
+        try:
+            return llm.detokenize([token], **kwargs).decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+    return ""
+
+
+def _gguf_text_handler(llm):
+    """A chat handler over the model's own template, with reasoning switched off.
+
+    `create_chat_completion` renders the GGUF's `tokenizer.chat_template` through
+    llama-cpp's `Jinja2ChatFormatter`, but on 0.4.x there is no argument that
+    reaches the template with `enable_thinking=false`: the signature is fixed,
+    `chat_template_kwargs` raises `TypeError`, and the retry without it left the
+    switch off the wire entirely. So the same formatter is built here over the
+    same template with `GGUF_TEMPLATE_PREFIX` in front, which is a
+    renderer-independent way to set the variables. It is the text-only route
+    for **Model thinking = Off**; turns that carry media still need the vision
+    handler, and **Keep** uses llama-cpp's own rendering.
+    """
+    template = _gguf_template(llm)
+    if not template.strip():
+        return None
+    try:
+        from llama_cpp import llama_chat_format
+
+        formatter_cls = llama_chat_format.Jinja2ChatFormatter
+        try:
+            params = inspect.signature(formatter_cls.__init__).parameters
+        except (TypeError, ValueError):
+            params = {}
+        eos_id = int(llm.token_eos())
+        bos_id = int(llm.token_bos())
+        kwargs: dict[str, Any] = {
+            "template": GGUF_TEMPLATE_PREFIX + template,
+            "eos_token": _gguf_token_text(llm, eos_id),
+            "bos_token": _gguf_token_text(llm, bos_id),
+        }
+        ids: dict[str, int] = {}
+        for key, getter_name in (
+            ("eot_token", "token_eot"), ("sep_token", "token_sep"), ("nl_token", "token_nl"), ("pad_token", "token_pad"),
+        ):
+            getter = getattr(llm, getter_name, None)
+            if callable(getter):
+                try:
+                    ids[key] = int(getter())
+                except Exception:
+                    continue
+        if "stop_token_ids" in params:
+            stop_ids = [token for token in (eos_id, ids.get("eot_token", -1)) if token >= 0]
+            if stop_ids:
+                kwargs["stop_token_ids"] = stop_ids
+        if "special_tokens_map" in params:
+            special = {key: _gguf_token_text(llm, token) for key, token in ids.items() if token >= 0}
+            kwargs["special_tokens_map"] = {key: text for key, text in special.items() if text}
+        return formatter_cls(**kwargs).to_chat_handler()
+    except Exception as exc:
+        logging.warning(
+            LOG_PREFIX + "could not build the GGUF chat template with reasoning off (%s); "
+            "falling back to llama-cpp's own rendering.", exc,
+        )
+        return None
+
+
+def _gguf_accepts_template_kwargs(llm) -> bool:
+    """Whether this build's `create_chat_completion` takes `chat_template_kwargs`.
+
+    Some 0.3.x forks do; 0.4.x does not (fixed signature, no `**kwargs`).
+    Unknown means "send it and let the TypeError fallback decide".
+    """
+    try:
+        return "chat_template_kwargs" in inspect.signature(llm.create_chat_completion).parameters
+    except (TypeError, ValueError):
+        return True
+
+
+def _gguf_request_has_media(request: Mapping[str, Any]) -> bool:
+    for message in request.get("messages") or []:
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(content, list) and any(
+            isinstance(part, Mapping) and str(part.get("type") or "text") != "text" for part in content
+        ):
+            return True
+    return False
+
+
 _GGUF_LOCK = threading.RLock()
-_GGUF_STATE: dict[str, Any] = {"signature": None, "llm": None, "vision": False}
+_GGUF_STATE: dict[str, Any] = {
+    "signature": None, "llm": None, "vision": False, "text_handler": None, "template_kwargs": True,
+}
 # How many runs are inside the local backend right now. The Unload button can
 # arrive from the editor at any moment, and closing a `Llama` that a worker
 # thread is still generating with takes llama-cpp down with it.
@@ -1670,6 +1860,8 @@ def _gguf_release() -> None:
         _GGUF_STATE["llm"] = None
         _GGUF_STATE["signature"] = None
         _GGUF_STATE["vision"] = False
+        _GGUF_STATE["text_handler"] = None
+        _GGUF_STATE["template_kwargs"] = True
     if llm is not None:
         try:
             llm.close()
@@ -1746,21 +1938,48 @@ def _gguf_model(settings: Mapping[str, Any], want_vision: bool):
     )
     started = time.perf_counter()
     llm = Llama(**kwargs)
-    _log("GGUF loaded in %.1fs", time.perf_counter() - started)
+    text_handler = _gguf_text_handler(llm)
+    template_kwargs = _gguf_accepts_template_kwargs(llm)
+    _log(
+        "GGUF loaded in %.1fs (%s)",
+        time.perf_counter() - started,
+        "reasoning can be switched off in the model's chat template" if text_handler is not None
+        else "no chat template in this file, so reasoning cannot be switched off from here",
+    )
     with _GGUF_LOCK:
         _GGUF_STATE["llm"] = llm
         _GGUF_STATE["signature"] = signature
         _GGUF_STATE["vision"] = handler is not None
+        _GGUF_STATE["text_handler"] = text_handler
+        _GGUF_STATE["template_kwargs"] = template_kwargs
     return llm, handler is not None
 
 
 def _gguf_call(llm, request: Mapping[str, Any], **extra):
-    """Call llama-cpp, dropping the template kwargs an old build cannot take.
+    """Call llama-cpp with the thinking switch on whichever path can carry it.
 
-    `chat_template_kwargs` only reaches the Jinja renderer on recent builds;
-    older ones raise `TypeError` for the unknown argument instead of ignoring
-    it. Losing the thinking switch is better than losing the answer.
+    `chat_template_kwargs` in the request means **Model thinking = Off**. Such a
+    turn without media is rendered by `_gguf_text_handler` - the model's own
+    template with the switch set inside it - so it never depends on what
+    `create_chat_completion` accepts. A turn with media has to go through the
+    vision handler installed on the model, which renders its own template; its
+    `enable_thinking` is set per turn. A **Keep** turn takes llama-cpp's own
+    rendering, which is the model's default.
+
+    `chat_template_kwargs` is sent only where the signature declares it; a
+    build that takes it through `**kwargs` is caught by the `TypeError` retry.
     """
+    request = dict(request)
+    thinking_off = "chat_template_kwargs" in request
+    with _GGUF_LOCK:
+        cached = _GGUF_STATE.get("llm") is llm
+        text_handler = _GGUF_STATE.get("text_handler") if cached else None
+        template_kwargs = bool(_GGUF_STATE.get("template_kwargs", True)) if cached else True
+    if not template_kwargs:
+        request.pop("chat_template_kwargs", None)
+    if thinking_off and text_handler is not None and not _gguf_request_has_media(request):
+        return text_handler(llama=llm, **request, **extra)
+    _gguf_set_handler_thinking(llm, not thinking_off)
     try:
         return llm.create_chat_completion(**request, **extra)
     except TypeError:
@@ -1840,9 +2059,10 @@ def _gguf_chat(
     }
     if no_think:
         # Newer Qwen templates dropped the `/no_think` token for a template
-        # variable. llama-cpp only forwards this when it renders a Jinja
-        # template, and ignores it otherwise, so sending both is the only way to
-        # cover the whole family.
+        # variable. Only some builds take it as an argument; where they do not,
+        # `_gguf_call` drops it and the same values are set inside the template
+        # instead (`GGUF_TEMPLATE_PREFIX`). Its presence is also how `_gguf_call`
+        # tells an Off turn from a Keep turn.
         request["chat_template_kwargs"] = {"enable_thinking": False, "reasoning_effort": REASONING_EFFORT}
 
     def finish(raw: Any) -> str:
@@ -1892,18 +2112,20 @@ def _gguf_describe(
         # the extra buys is room for a thought that is discarded either way.
         # Without it Gemma stops mid-thought and every description comes back
         # empty, which used to leave the final pass answering about no media
-        # at all.
+        # at all. The 0.4.x Gemma 4 handler takes `enable_thinking` and is
+        # built with it off; older builds have no such switch, and the headroom
+        # is what covers them.
         length += DESCRIBE_THINKING_HEADROOM
     temperature = float(settings.get("temperature", CONFIG_DEFAULTS["temperature"]))
     started = time.perf_counter()
     _log("describing %d connected media with the GGUF, one at a time (max_tokens=%d)", len(describable), length)
     lines: list[str] = []
     # The budget is raised for the rest of the run the first time a description
-    # is lost to an unterminated thought. The switches ask the model for no
-    # reasoning, but a vision chat handler renders no Jinja template, so neither
-    # `enable_thinking` nor `reasoning_effort` reaches it there and the budget is
-    # all that is left. Paying for one discarded thought beats losing every
-    # description.
+    # is lost to an unterminated thought. A vision chat handler renders its own
+    # template, so nothing in the request reaches it; the switch is a
+    # constructor argument where the class has one, and where it has none the
+    # budget is all that is left. Paying for one discarded thought beats losing
+    # every description.
     budget = length
     try:
         for index, item in enumerate(describable, start=1):

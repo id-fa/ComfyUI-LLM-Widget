@@ -142,8 +142,26 @@ already-resolved `media_items`, so neither caller knows about the other's media 
 - **gguf** (`_gguf_generate`) — `llama-cpp-python`. The loaded `Llama` is cached in `_GGUF_STATE`
   keyed by `(model, mmproj, ctx, gpu_layers)` and released when that changes, on
   `gguf_unload_after`, on cancel, or from the toolbar's ⏏ (`POST /llm_widget/unload`). Vision
-  needs an mmproj plus a chat handler class whose name varies per llama-cpp build/fork, so
-  `_gguf_chat_handler` probes candidates by model-name family and degrades to text-only.
+  needs an mmproj plus a chat handler class whose name and module vary per llama-cpp build/fork
+  (`llama_multimodal` on 0.4.x, `llama_chat_format` before), so `_gguf_chat_handler` probes
+  candidates by model-name family (`_gguf_handler_candidates`) and degrades to text-only.
+  **`qwen3.5` and later must map to `Qwen35ChatHandler`, not `Qwen3VLChatHandler`**: the Qwen3-VL
+  template has no thinking switch, and a Qwen3.5 model rendered through it thinks through the
+  entire answer budget (that was the `_ThinkingOverflow` at 8192 tokens on 2026-09-23). The handler
+  is constructed with whichever switch its signature declares (`enable_thinking` on 0.4.x,
+  `force_reasoning` on the older Qwen handlers), and `_gguf_set_handler_thinking` flips
+  `enable_thinking` per turn so **Keep** still works on the vision path.
+- **llama-cpp-python 0.4.x has no `chat_template_kwargs`** — `create_chat_completion` has a fixed
+  signature, so `enable_thinking=false` never reached the template and every text-only turn ran
+  with the model's default (Qwen3.5 pre-opens `<think>`). Text-only **Off** turns therefore go
+  through `_gguf_text_handler`: llama-cpp's own `Jinja2ChatFormatter` over the GGUF's
+  `tokenizer.chat_template` with `GGUF_TEMPLATE_PREFIX` (`{% set enable_thinking = false %}`,
+  `{% set reasoning_effort = … %}`) prepended, which sets the variables inside the template and so
+  works on every build. `_gguf_call` tells Off from Keep by the presence of `chat_template_kwargs`
+  in the request, routes a media-free Off turn there, sends everything else to
+  `create_chat_completion`, and drops `chat_template_kwargs` up front when the signature lacks it
+  (`_gguf_accepts_template_kwargs`). Both are cached next to the `Llama` in `_GGUF_STATE`. Do not
+  replace the prefix with render kwargs: the handler wrapper passes none through.
   `_generate` holds `_gguf_hold` for the whole local run so the unload route can refuse while a
   worker thread is generating — closing that `Llama` mid-generation takes llama-cpp down with it.
   Every other `_gguf_release` call site already runs after the run unwound.
@@ -215,7 +233,8 @@ Three things that mode gets wrong if you are not careful, found with Gemma 4 and
   `_clean_output` correctly returned nothing at all and *every* description came back empty.
   `DESCRIBE_THINKING_HEADROOM` is added for the families with no working switch (gemma), and is
   deliberately not tied to `max_length`: it buys room for text that is discarded either way.
-- **A vision chat handler renders no chat template**, so neither switch reaches the model on the
+- **A vision chat handler renders its own chat template**, so nothing in the request reaches the
+  model; where its class has no constructor switch, neither variable reaches the model on the
   describe path and the budget is the only lever left. `_gguf_chat` raises `_ThinkingOverflow` for
   exactly that failure, and `_gguf_describe` retries the media with `DESCRIBE_THINKING_HEADROOM` on
   top and keeps the raised budget for the rest of the run — one wasted pass, not one lost
@@ -274,7 +293,8 @@ The `thinking` setting is `off` (default) or `keep`; `off` means *both* "send th
    OpenAI-compatible server reasoned freely into the answer. The switches now go through
    `_thinking_off_payload`, and `_http_post` retries once **without** them on 400/404/422, because
    an endpoint that has never heard of `chat_template_kwargs` answers with an error rather than
-   ignoring it. `_gguf_call` does the same for llama-cpp builds too old to accept the argument.
+   ignoring it. `_gguf_call` keeps the same retry but no longer depends on it: a build whose
+   signature lacks the argument never gets it, and the switch lives in the template instead.
    Qwen3.8 reads the *depth* rather than the switch and defaults to `xhigh`, hence
    `REASONING_EFFORT = "low"`; both fields go in the same dict because older templates read only
    `enable_thinking`, and `none` is not a value that template accepts.

@@ -254,8 +254,9 @@ IME も、リサイズも、undo も今までどおり効きます。ワーク�
 エディタがしばらく固まったように見える原因です。この方式なら、メディアとメディアの間で
 キャンセルが効く余地も生まれます。
 
-説明パスにはこのモード専用のトークン上限があります。Gemma のように **推論を止める手段が無い**
-モデルは、その枠を思考で使い切ってしまい、思考の途中で打ち切られた出力には答えが 1 文字も
+説明パスにはこのモード専用のトークン上限があります。**推論を止める手段が無い** モデル（Gemma に
+`/no_think` は無く、0.4 より前の llama-cpp では handler にもスイッチがありません）は、その枠を
+思考で使い切ってしまい、思考の途中で打ち切られた出力には答えが 1 文字も
 含まれません（閉じマーカーが来ないため）。そこで Gemma 系にだけ思考ぶんの余白を上乗せしています
 （`max_length` とは別枠です。どうせ捨てるテキストのための余白なので）。
 
@@ -303,10 +304,23 @@ IME も、リサイズも、undo も今までどおり効きます。ワーク�
 ### 推論（thinking）
 
 **Model thinking = Off**（既定）のとき、リクエストには各バックエンドが解釈できるスイッチが
-すべて載ります。OpenAI 互換サーバーと llama-cpp には `chat_template_kwargs.enable_thinking=false`、
-Gemini には `thinkingConfig.thinkingBudget=0`、Qwen 系には `/no_think`、llama-cpp の vision handler
-には `force_reasoning=False`。未知のフィールドを拒否するエンドポイントに対しては、それを外して
-もう一度送るので、厳格な API でもちゃんと答えが返ります。
+すべて載ります。OpenAI 互換サーバーには `chat_template_kwargs.enable_thinking=false`、
+Gemini には `thinkingConfig.thinkingBudget=0`、Qwen 系には `/no_think`。未知のフィールドを
+拒否するエンドポイントに対しては、それを外してもう一度送るので、厳格な API でもちゃんと答えが
+返ります。
+
+GGUF ではスイッチを **モデル自身のチャットテンプレートの中** で立てます。メディアを含まない
+ターンは、GGUF の `tokenizer.chat_template` の先頭に `enable_thinking = false` と
+`reasoning_effort = low` を付けたものを llama-cpp の Jinja フォーマッタで描画するので、
+llama-cpp-python のバージョンに依存しません。llama-cpp-python 0.4.x には `chat_template_kwargs`
+引数そのものが無く、以前の版はそれを送って `TypeError` を受け、外して再送した結果、モデルの
+既定（Qwen3.5 では思考オン）で走っていました。Qwen3.5 の GGUF はそのまま `max_length` を
+全部思考に使い切り（「The model spent all N tokens reasoning…」）、N をいくら増やしても同じでした。
+メディアを含むターンは vision handler を通ります。handler は自前のテンプレートを描画するため、
+そのクラスが持つスイッチ（0.4.x では `enable_thinking=False`、旧 Qwen handler では
+`force_reasoning=False`）をコンストラクタで渡し、**Keep** のターンではターンごとに戻します。
+handler の族はファイル名から選びますが、`qwen3.5` / `qwen3.6` … は Qwen3-VL 用ではなく
+Qwen3.5 用を選びます。Qwen3-VL のテンプレートには切るべきスイッチがありません。
 
 Qwen3.8 はオン／オフのスイッチを **深さ** に変えました。テンプレートが読むのは `reasoning_effort`
 で、既定は `xhigh` です。そのため `chat_template_kwargs` には `enable_thinking=false` と一緒に
@@ -606,7 +620,8 @@ reason the editor can appear frozen for a while. It also gives cancellation a ch
 land between assets.
 
 The describe pass has a token budget of its own. A model whose reasoning **cannot be switched
-off** — Gemma has no `/no_think` and its chat handler rejects the flag — spends that budget on
+off** — Gemma has no `/no_think`, and on llama-cpp builds before 0.4 its chat handler has no
+switch — spends that budget on
 the thought, and an output cut off mid-thought contains no answer at all, since the closing
 marker never arrives. Gemma-family models therefore get extra headroom on top (separate from
 `max_length`, because it pays for text that is discarded anyway).
@@ -658,10 +673,23 @@ button is not worth it.
 ### Reasoning
 
 With **Model thinking = Off** (the default) the request carries every switch the backends
-understand — `chat_template_kwargs.enable_thinking=false` for OpenAI-compatible servers and
-llama-cpp, `thinkingConfig.thinkingBudget=0` for Gemini, `/no_think` for the Qwen family,
-`force_reasoning=False` on the llama-cpp vision handler. An endpoint that rejects the
-unknown field gets the request again without it, so a stricter API still answers.
+understand — `chat_template_kwargs.enable_thinking=false` for OpenAI-compatible servers,
+`thinkingConfig.thinkingBudget=0` for Gemini, `/no_think` for the Qwen family. An endpoint
+that rejects the unknown field gets the request again without it, so a stricter API still
+answers.
+
+For GGUF the switch is set **inside the model's own chat template**: a turn without media is
+rendered through llama-cpp's Jinja formatter over the GGUF's `tokenizer.chat_template` with
+`enable_thinking = false` and `reasoning_effort = low` prepended, so it works on every
+llama-cpp-python build. llama-cpp-python 0.4.x has no `chat_template_kwargs` argument at all;
+earlier versions of this widget sent it, got a `TypeError`, retried without it and ran with the
+model's default, which for Qwen3.5 is *thinking* — a Qwen3.5 GGUF then spent the whole
+`max_length` reasoning ("The model spent all N tokens reasoning…") however large N was set. A
+turn *with* media goes through the vision chat handler, which renders its own template and is
+constructed with whichever switch its class declares (`enable_thinking=False` on 0.4.x,
+`force_reasoning=False` on the older Qwen handlers); a **Keep** turn flips it back per turn.
+The handler family is chosen from the filename, and `qwen3.5` / `qwen3.6` / … pick the Qwen3.5
+handler rather than the Qwen3-VL one, whose template has no switch to turn.
 
 Qwen3.8 turned that on/off switch into a **depth**: its template reads `reasoning_effort`
 and defaults to `xhigh`. `chat_template_kwargs` therefore carries `reasoning_effort=low` —
