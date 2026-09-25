@@ -319,9 +319,13 @@ returns "" because there genuinely is no answer in it. `_gguf_chat` turns that s
 an error that says so (`_opens_with_thinking`) instead of an unexplained empty answer: the user
 can act on "raise Max answer tokens", not on "empty".
 
-`_clean_output` unwraps a whole-answer code fence **only** for languages in `_PLAIN_FENCE_LANGS`.
+`_clean_output` unwraps a whole-answer code fence **only** for languages in `_PLAIN_FENCE_LANGS`
+(`json` is one of them: a model asked for JSON fences it, and the consumer wants the document).
 A ` ```python ` block is the answer itself; stripping it would corrupt a legitimate request for
-code. This is a deliberate divergence from the MiniMax H3 optimizer, which always strips fences.
+code. "Whole answer" means the fence opens the first line, closes the last, and no other line in
+between opens one (`_INNER_FENCE_RE`): two blocks with prose between them are several blocks, not
+one wrapped answer, and unwrapping the outer pair would strand the inner fences. This is a
+deliberate divergence from the MiniMax H3 optimizer, which always strips fences.
 
 ## Text fields stay native
 

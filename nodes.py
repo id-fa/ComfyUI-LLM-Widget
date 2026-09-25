@@ -606,8 +606,13 @@ _OPEN_CHANNEL_RE = re.compile(rf"\A\s*{_CHANNEL_MARK}\s*(?:{_THINK_TAGS})\b", fl
 _TRAILING_TOKEN_RE = re.compile(r"<\|(?:return|end|endoftext|im_end)\|>\s*\Z", flags=re.I)
 _WHOLE_FENCE_RE = re.compile(r"\A```([A-Za-z0-9_+.-]*)[ \t]*\r?\n(.*?)\r?\n?```\Z", flags=re.S)
 # Fences that only wrap prose are unwrapped; a ```python block is the answer
-# itself and is left exactly as the model wrote it.
-_PLAIN_FENCE_LANGS = {"", "text", "txt", "plain", "plaintext", "prompt", "output"}
+# itself and is left exactly as the model wrote it. `json` is here because a
+# model asked for JSON tends to present it fenced, and the consumer of that
+# answer wants the document, not the Markdown around it.
+_PLAIN_FENCE_LANGS = {"", "text", "txt", "plain", "plaintext", "prompt", "output", "json"}
+# A fence opening a line inside the body means the answer is several blocks
+# with prose between them, not one wrapped answer; that is left alone.
+_INNER_FENCE_RE = re.compile(r"^[ \t]*```", flags=re.M)
 
 
 def _opens_with_thinking(text: Any) -> bool:
@@ -643,7 +648,11 @@ def _clean_output(text: Any, strip_thinking: bool = True) -> str:
             # so there is no answer in here at all.
             return ""
     match = _WHOLE_FENCE_RE.match(value)
-    if match and match.group(1).lower() in _PLAIN_FENCE_LANGS:
+    if (
+        match
+        and match.group(1).lower() in _PLAIN_FENCE_LANGS
+        and not _INNER_FENCE_RE.search(match.group(2))
+    ):
         value = match.group(2)
     return value.strip()
 
