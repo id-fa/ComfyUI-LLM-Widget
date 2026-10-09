@@ -67,6 +67,33 @@ token / non-simple header, no Host allowlist, no authentication), and every rout
   check stops it. `allowed_hosts` in `llm_widget.json` is the escape hatch for a same-machine
   reverse proxy, and `_update_config` deliberately never takes it from the request.
 
+**Where the server may connect is not the request's choice either.** 0.2.1–0.2.3 were *flagged*
+(`policy-v0.5: ssrf`): `POST /settings` sets `api_url`, `_http_generate` and `_remote_unload` then
+send the API key, the prompt and the images there and hand the body (or the first 1000 chars of
+the error) back, so whoever reaches the route picks where this process connects and reads the
+answer. The shape the reviewers have marked "reviewed safe" elsewhere (comfyui-custom-api 0.2.2,
+comfyui-cyberdelia-z-engineer 1.6.1) is an owner-held allowlist outside every route and workflow,
+and that is what `allowed_api_urls` is:
+
+- hand-edited in `llm_widget.json` only. `_update_config` keeps the stored list (as it does
+  `allowed_hosts`) and refuses, with a 400 naming the file, a save whose URL is off it — for the
+  HTTP formats only, so a stale URL under gguf blocks nothing. A missing key means
+  `DEFAULT_ALLOWED_API_URLS` (the local servers' default ports plus the two vendors the formats
+  name); an empty list means nothing is allowed;
+- compared by origin (`_url_origin`): scheme, host, port, loopback folded to `localhost`.
+  Link-local, unspecified and multicast literals are refused even when listed;
+- **every outbound request goes through `_urlopen`**, which checks the destination again and
+  opens through `_OPENER`, whose `_RefuseRedirect` turns a 3xx into an error: the check was made
+  against the URL asked for, not where it points. **A new call site uses `_urlopen`, never
+  `urllib.request.urlopen`.** `_validate` and `_remote_unload` check up front as well, only so the
+  message is the real one instead of a listing probe swallowing it;
+- the list is not secret: `_public_config` passes it through so the dialog can show it under the
+  URL field. The JS does not duplicate the defaults.
+
+Do not make the check "block private ranges": the LLM server *is* on loopback or the LAN, and the
+owner's explicit entry is the authority. Do not add a route or a dialog control that edits the
+list, however convenient — that is the exact hole.
+
 **The API key never goes back to the editor**: `_public_config` blanks it and adds `api_key_set`;
 the dialog sends `api_key_keep` when the field was not touched and `_update_config` keeps the stored
 key. `isConfigured` therefore reads `api_key_set`, never `api_key`.
@@ -403,7 +430,8 @@ route paths under `/llm_widget/`, `ANSWER_EVENT`, `TOKEN_HEADER`, the four forma
 `GGUF_MMPROJ_NONE`, `CHAT_USER_MARK` / `CHAT_MODEL_MARK`, the `VIDEO_SAMPLES` ids, `IMAGE_INPUT_MAX` with the socket
 naming (`image`, `image2`, …), and every
 settings key with its clamp range (both sides normalize independently, and the server's
-normalization is authoritative).
+normalization is authoritative). `allowed_api_urls` is the exception: the JS only displays what
+`GET /settings` returns and never sends it, so its default lives in `nodes.py` alone.
 
 ## Conventions
 

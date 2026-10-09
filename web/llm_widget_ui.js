@@ -136,6 +136,9 @@ const SETTINGS_DEFAULTS = Object.freeze({
     clip_unload_after: false,
     // Read-only, from the server: the key itself is never sent to the editor.
     api_key_set: false,
+    // Read-only, from the server: the origins an HTTP backend may be sent to.
+    // Hand-edited in llm_widget.json; the settings route never takes it.
+    allowed_api_urls: [],
 });
 
 const TEXT = {
@@ -155,6 +158,11 @@ const TEXT = {
     running: "Thinking",
     apiFormat: "API format",
     apiUrl: "API URL",
+    apiUrlHint: "Requests are only sent to these destinations (scheme, host and port must match): ",
+    apiUrlHintNone: "none",
+    apiUrlHintEdit:
+        ". To add one, edit \"allowed_api_urls\" in llm_widget.json next to nodes.py; this dialog cannot "
+        + "change the list.",
     apiKey: "API key",
     apiKeyStored: "stored - type to replace it",
     model: "Model",
@@ -274,6 +282,9 @@ function normalizeSettings(value) {
         clip_model: String(source.clip_model || "").trim(),
         clip_unload_after: asBoolean(source.clip_unload_after, false),
         api_key_set: asBoolean(source.api_key_set, false),
+        allowed_api_urls: Array.isArray(source.allowed_api_urls)
+            ? source.allowed_api_urls.map((item) => String(item || "").trim()).filter(Boolean)
+            : [],
     };
 }
 
@@ -316,7 +327,9 @@ async function loadSettings({ force = false } = {}) {
 }
 
 async function saveSettings(value, keepApiKey = false) {
-    const settings = normalizeSettings(value);
+    // The server's own fields are not sent back: it would ignore them anyway,
+    // and the allowlist in particular is exactly what a request may not set.
+    const { api_key_set: _apiKeySet, allowed_api_urls: _allowedApiUrls, ...settings } = normalizeSettings(value);
     const response = await callRoute(SETTINGS_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -782,6 +795,13 @@ async function openSettings() {
     const hint = document.createElement("p");
     hint.className = "llmw-hint";
     const apiUrlRow = makeRow(TEXT.apiUrl, apiUrl);
+    // The server says where it is willing to send a request; the URL typed
+    // above has to be one of them, and the list is not editable from here.
+    const apiUrlHint = document.createElement("p");
+    apiUrlHint.className = "llmw-hint";
+    apiUrlHint.textContent = TEXT.apiUrlHint
+        + (settingsCache.allowed_api_urls.length ? settingsCache.allowed_api_urls.join(", ") : TEXT.apiUrlHintNone)
+        + TEXT.apiUrlHintEdit;
     const apiKeyRow = makeRow(TEXT.apiKey, apiKey);
     const modelRow = makeRow(TEXT.model, model);
     const thinkingRow = makeRow(TEXT.thinking, thinking);
@@ -814,6 +834,7 @@ async function openSettings() {
         makeRow(TEXT.apiFormat, apiFormat),
         hint,
         apiUrlRow,
+        apiUrlHint,
         apiKeyRow,
         modelRow,
         ggufModelRow,
@@ -886,7 +907,7 @@ async function openSettings() {
         const gguf = apiFormat.value === FORMAT_GGUF;
         const gemini = apiFormat.value === FORMAT_GEMINI;
         const clip = apiFormat.value === FORMAT_CLIP;
-        for (const row of [apiUrlRow, apiKeyRow, modelRow]) row.hidden = gguf || clip;
+        for (const row of [apiUrlRow, apiUrlHint, apiKeyRow, modelRow]) row.hidden = gguf || clip;
         for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadRow]) row.hidden = !gguf;
         for (const row of [clipModelRow, clipUnloadRow]) row.hidden = !clip;
         // Describing media one at a time only means something once media is sent.

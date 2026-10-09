@@ -80,6 +80,24 @@ HISTORY_TURNS_DEFAULT = 8
 HISTORY_TURNS_MIN = 1
 HISTORY_TURNS_LIMIT = 64
 
+# Where an HTTP backend may be sent. The settings dialog types the URL, but the
+# server only ever contacts an origin (`scheme://host:port`) on this list, and
+# the list is hand-edited in llm_widget.json: no route and no workflow can grow
+# it. Without that, whoever reaches the settings route chooses where this
+# process sends the API key, the prompt and the images, and gets the reply back
+# — a server-side request forgery, which is what versions 0.2.1–0.2.3 were
+# flagged for on the Comfy Registry. The default covers the local servers this
+# is used with, on their default ports, and the two vendors the formats name.
+ALLOWED_API_URLS_KEY = "allowed_api_urls"
+DEFAULT_ALLOWED_API_URLS = (
+    "http://localhost:1234",  # LM Studio
+    "http://localhost:11434",  # Ollama
+    "http://localhost:8080",  # llama.cpp server
+    "http://localhost:8000",  # vLLM
+    "https://api.openai.com",
+    "https://generativelanguage.googleapis.com",
+)
+
 HTTP_TIMEOUT_SECONDS = 600
 # Freeing a model is quick; a request that hangs here should not sit for the ten
 # minutes a generation is allowed.
@@ -213,6 +231,8 @@ CONFIG_DEFAULTS = {
     # Extra Host names the routes answer to, for a reverse proxy on this machine.
     # Hand-edited only: the settings route never writes it.
     "allowed_hosts": [],
+    # The origins an HTTP backend may be sent to. Hand-edited only, same reason.
+    ALLOWED_API_URLS_KEY: list(DEFAULT_ALLOWED_API_URLS),
 }
 
 _CONFIG_LOCK = threading.RLock()
@@ -278,6 +298,11 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
     if video_sample not in VIDEO_SAMPLES:
         video_sample = VIDEO_SAMPLE_DEFAULT
     hosts = source.get("allowed_hosts")
+    destinations = source.get(ALLOWED_API_URLS_KEY)
+    if not isinstance(destinations, (list, tuple)):
+        # The key is missing from a file written before it existed: the default
+        # list. An empty list, on the other hand, is the owner saying "nothing".
+        destinations = DEFAULT_ALLOWED_API_URLS
     return {
         "version": CONFIG_VERSION,
         "api_format": api_format,
@@ -304,6 +329,7 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
             str(host).strip().lower() for host in (hosts if isinstance(hosts, (list, tuple)) else [])
             if str(host).strip()
         ],
+        ALLOWED_API_URLS_KEY: _allowed_origins(destinations),
     }
 
 
@@ -362,12 +388,22 @@ def _update_config(payload: Mapping[str, Any]) -> dict[str, Any]:
     with _CONFIG_LOCK:
         stored = _read_config()
         merged = dict(payload)
-        # What decides who may call the routes cannot be settable through one.
+        # What decides who may call the routes, and where they may send this
+        # process, cannot be settable through one.
         merged["allowed_hosts"] = stored["allowed_hosts"]
+        merged[ALLOWED_API_URLS_KEY] = stored[ALLOWED_API_URLS_KEY]
         # The dialog never had the key, so an untouched field means "as it was".
         if _as_bool(payload.get("api_key_keep")):
             merged["api_key"] = stored["api_key"]
-        return _write_config(merged)
+        normalized = _normalize_config(merged)
+        # Refuse the URL at save time so the dialog says why, not the next ✦.
+        # Only for the formats that use it: a stale URL under gguf is nobody's
+        # problem and must not block saving the rest.
+        if normalized["api_format"] in (FORMAT_OPENAI, FORMAT_GEMINI) and normalized["api_url"]:
+            problem = _destination_problem(_normalize_base_url(normalized["api_url"]), normalized)
+            if problem:
+                raise ValueError(problem)
+        return _write_config(normalized)
 
 
 # --------------------------------------------------------------------------- #
@@ -431,6 +467,105 @@ def _request_problem(request, token: bool = True) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Outbound destinations
+# --------------------------------------------------------------------------- #
+
+
+# DNS labels, with the underscore some internal names carry; an IDN arrives punycoded.
+_HOSTNAME_RE = re.compile(r"[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*\.?")
+
+
+def _url_origin(url: str) -> str:
+    """`scheme://host:port` of a URL, in the one spelling the allowlist compares.
+
+    Lowercased, the default port written out, an IPv6 literal bracketed, and
+    every loopback address — `127.0.0.1`, `::1`, `localhost` — spelled
+    `localhost`, so the list does not need three entries per local server.
+    """
+    parts = urllib.parse.urlsplit(str(url or "").strip())
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Only http and https URLs are accepted, not '{scheme or url}'")
+    host = (parts.hostname or "").lower()
+    if not host:
+        raise ValueError(f"The URL '{url}' has no host")
+    if not _is_ip_literal(host) and not _HOSTNAME_RE.fullmatch(host):
+        raise ValueError(f"The URL '{url}' has an invalid host")
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError(f"The URL '{url}' has an invalid port") from exc
+    port = port or (443 if scheme == "https" else 80)
+    if _is_ip_literal(host):
+        address = ipaddress.ip_address(host)
+        if address.is_loopback:
+            host = "localhost"
+        elif address.is_link_local or address.is_unspecified or address.is_multicast:
+            # Cloud metadata services live on link-local addresses, and nothing
+            # that answers a chat request does. Not even the allowlist can
+            # name these.
+            raise ValueError(f"'{host}' is not an address an API server can have")
+        elif address.version == 6:
+            host = f"[{host}]"
+    return f"{scheme}://{host}:{port}"
+
+
+def _allowed_origins(entries: Sequence[Any]) -> list[str]:
+    """The allowlist as origins, keeping the order and dropping what is not a URL.
+
+    An entry may be a bare `host:port` or carry a path (`.../v1`): only its
+    origin matters, and it is completed the same way the API URL is.
+    """
+    origins: list[str] = []
+    for entry in entries:
+        text = str(entry or "").strip()
+        if not text:
+            continue
+        try:
+            origin = _url_origin(_normalize_base_url(text))
+        except ValueError:
+            logging.warning(LOG_PREFIX + "ignoring '%s' in %s: not a URL", text, ALLOWED_API_URLS_KEY)
+            continue
+        if origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+def _destination_problem(url: str, settings: Mapping[str, Any] | None = None) -> str:
+    """Why this process may not send a request to `url`, or "" when it may."""
+    try:
+        origin = _url_origin(url)
+    except ValueError as exc:
+        return str(exc)
+    allowed = (settings if settings is not None else _read_config())[ALLOWED_API_URLS_KEY]
+    if origin in allowed:
+        return ""
+    listed = ", ".join(allowed) if allowed else "none"
+    return (
+        f"{origin} is not an allowed API destination. Add it to \"{ALLOWED_API_URLS_KEY}\" in "
+        f"{CONFIG_FILENAME} (next to nodes.py; only that file can change the list). Allowed now: {listed}"
+    )
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is an error, not a hop: the allowlist was checked against the URL asked for."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.URLError(f"the server redirected to {newurl}, and redirects are not followed")
+
+
+_OPENER = urllib.request.build_opener(_RefuseRedirect)
+
+
+def _urlopen(request: urllib.request.Request, timeout: float):
+    """The one way out. Every outbound request is checked here, whatever built it."""
+    problem = _destination_problem(request.full_url)
+    if problem:
+        raise urllib.error.URLError(problem)
+    return _OPENER.open(request, timeout=timeout)
+
+
+# --------------------------------------------------------------------------- #
 # URL handling
 # --------------------------------------------------------------------------- #
 
@@ -445,8 +580,14 @@ def _normalize_base_url(api_url: str) -> str:
     base = str(api_url or "").strip().rstrip("/")
     if not base:
         raise ValueError("API URL is required")
-    if not re.match(r"^https?://", base, flags=re.I):
-        base = "https://" + base
+    if not re.match(r"^[a-z][a-z0-9+.-]*://", base, flags=re.I):
+        # A bare `host:port` gets the scheme its host implies: a local server
+        # speaks plain HTTP, anything out on the internet is HTTPS.
+        host = urllib.parse.urlsplit("//" + base).hostname or ""
+        local = host == "localhost" or (
+            _is_ip_literal(host) and (ipaddress.ip_address(host).is_loopback or ipaddress.ip_address(host).is_private)
+        )
+        base = ("http://" if local else "https://") + base
     return base.rstrip("/")
 
 
@@ -1282,7 +1423,7 @@ def _http_post(
             url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers=dict(headers), method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            with _urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
@@ -1316,7 +1457,7 @@ def _server_root(api_url: str) -> str:
 def _api_request(url: str, headers: Mapping[str, str], payload: Any = None, method: str = "GET") -> Any:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
     request = urllib.request.Request(url, data=data, headers=dict(headers), method=method)
-    with urllib.request.urlopen(request, timeout=UNLOAD_TIMEOUT_SECONDS) as response:
+    with _urlopen(request, timeout=UNLOAD_TIMEOUT_SECONDS) as response:
         body = response.read().decode("utf-8", errors="replace")
     return json.loads(body) if body.strip() else {}
 
@@ -1405,6 +1546,11 @@ def _remote_unload(settings: Mapping[str, Any]) -> tuple[int, str]:
         headers["Authorization"] = f"Bearer {api_key}"
     if not model:
         raise ValueError("Set the model in the settings first")
+    # The probes swallow every error to tell the servers apart, so a refused
+    # destination would otherwise come out as "no unload endpoint".
+    problem = _destination_problem(root, settings)
+    if problem:
+        raise ValueError(problem)
 
     instances = _lmstudio_instances(root, headers)
     if instances is not None:
@@ -2709,7 +2855,13 @@ def _validate(settings: Mapping[str, Any]) -> str:
         name for name, key in (("API URL", "api_url"), ("model", "model"), ("API key", "api_key"))
         if not str(settings.get(key) or "").strip()
     ]
-    return f"The settings are incomplete: {', '.join(missing)} required" if missing else ""
+    if missing:
+        return f"The settings are incomplete: {', '.join(missing)} required"
+    try:
+        url = _normalize_url(str(settings["api_url"]), api_format, str(settings["model"]))
+    except ValueError as exc:
+        return str(exc)
+    return _destination_problem(url, settings)
 
 
 def _notify_answer(node_id: Any, answer: str) -> None:
@@ -2772,6 +2924,8 @@ def _register_routes() -> bool:
             payload = await request.json()
             saved = await asyncio.to_thread(_update_config, payload if isinstance(payload, dict) else {})
             return web.json_response({"ok": True, "settings": _public_config(saved)})
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 

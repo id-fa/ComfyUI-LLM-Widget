@@ -152,7 +152,7 @@ Reroute ノードは辿って追跡します。
 | 設定 | 対象 | 意味 |
 | --- | --- | --- |
 | API format | 全て | `OpenAI-compatible`、`Gemini`、`GGUF`、`ComfyUI text encoder` |
-| API URL | openai / gemini | パスは自動補完されます。`http://host:1234`、`.../v1`、完全な `/v1/chat/completions` のいずれでも可 |
+| API URL | openai / gemini | パスは自動補完されます。`http://host:1234`、`.../v1`、完全な `/v1/chat/completions` のいずれでも可。送信先は下記の `allowed_api_urls` にあるものだけ |
 | API key | openai / gemini | `Authorization: Bearer` / `x-goog-api-key` として送信 |
 | Model | openai / gemini | Gemini では id 単体、`models/<id>`、モデルの完全な URL のいずれでも可 |
 | GGUF model | gguf | スキャン対象フォルダで見つかった `.gguf` |
@@ -170,6 +170,36 @@ Reroute ノードは辿って追跡します。
 | Send the connected image / video | 全て | オフにすると質問は純粋なテキストとして送られます |
 | Video frames sent | 全て | 動画 1 本を何枚の静止画にするか（2〜12、既定 4）。Gemini はファイルをそのまま送るため無関係です |
 | Describe each media in its own pass | gguf | 下記参照 |
+
+### 送信先の許可リスト（`allowed_api_urls`）
+
+HTTP バックエンド（openai / gemini）への要求は、`llm_widget.json` の `allowed_api_urls` に
+載っている送信先にしか送られません。比較は **スキーム・ホスト・ポート**（オリジン）単位で、
+パスは見ません。`127.0.0.1`、`::1`、`localhost` は同じものとして扱います。既定値:
+
+```json
+"allowed_api_urls": [
+  "http://localhost:1234",
+  "http://localhost:11434",
+  "http://localhost:8080",
+  "http://localhost:8000",
+  "https://api.openai.com",
+  "https://generativelanguage.googleapis.com"
+]
+```
+
+LM Studio（1234）、Ollama（11434）、llama.cpp server（8080）、vLLM（8000）の既定ポートと、
+OpenAI / Gemini の公式エンドポイントです。別のポートや別のサーバー（OpenRouter、LAN 上の
+別マシンなど）を使うときは、`nodes.py` の隣にある `llm_widget.json` をテキストエディタで開いて
+この配列に追加してください。再起動は不要で、次の要求から反映されます。⚙ ダイアログには現在の
+リストが表示されますが、**ダイアログからは変更できません**。設定ルートが送ってきた値は無視され、
+リストにない URL の保存はその場で拒否されます。
+
+これは Comfy Registry の指摘（SSRF）への対処です。設定ルートで宛先を書き換えられると、
+この ComfyUI プロセスに API キー・質問・画像を任意のホストへ送らせ、その応答を読み取らせる
+ことができてしまうためです。宛先を決められるのはサーバーの持ち主がこのファイルで指定したものだけ、
+という形にしてあります。同じ理由で HTTP リダイレクトには従いません（3xx はエラーになります）。
+`169.254.*` などのリンクローカルアドレスはリストに書いても拒否されます。
 
 ### ComfyUI のテキストエンコーダを LLM として使う
 
@@ -514,7 +544,7 @@ API key** and is gitignored.
 | Setting | Applies to | Meaning |
 | --- | --- | --- |
 | API format | all | `OpenAI-compatible`, `Gemini`, `GGUF`, or `ComfyUI text encoder` |
-| API URL | openai / gemini | The path is completed for you: `http://host:1234` , `.../v1` and a full `/v1/chat/completions` all work |
+| API URL | openai / gemini | The path is completed for you: `http://host:1234` , `.../v1` and a full `/v1/chat/completions` all work. Only a destination listed in `allowed_api_urls` (below) is ever contacted |
 | API key | openai / gemini | Sent as `Authorization: Bearer` / `x-goog-api-key` |
 | Model | openai / gemini | For Gemini a bare id, `models/<id>` or a full model URL are all accepted |
 | GGUF model | gguf | Any `.gguf` found under the scanned folders |
@@ -532,6 +562,37 @@ API key** and is gitignored.
 | Send the connected image / video | all | Off means the question is asked as pure text |
 | Video frames sent | all | How many stills one video becomes (2–12, default 4). Not used by Gemini, which gets the file whole |
 | Describe each media in its own pass | gguf | See below |
+
+### Allowed destinations (`allowed_api_urls`)
+
+A request to an HTTP backend (openai / gemini) is only sent to a destination listed under
+`allowed_api_urls` in `llm_widget.json`. The comparison is by **scheme, host and port** (the
+origin); the path does not matter, and `127.0.0.1`, `::1` and `localhost` count as the same
+host. The default:
+
+```json
+"allowed_api_urls": [
+  "http://localhost:1234",
+  "http://localhost:11434",
+  "http://localhost:8080",
+  "http://localhost:8000",
+  "https://api.openai.com",
+  "https://generativelanguage.googleapis.com"
+]
+```
+
+That is LM Studio (1234), Ollama (11434), llama.cpp server (8080) and vLLM (8000) on their
+default ports, plus the official OpenAI and Gemini endpoints. For another port or another
+server — OpenRouter, a box on the LAN — open `llm_widget.json` next to `nodes.py` in a text
+editor and add it to the array. No restart is needed; the next request reads the file. The ⚙
+dialog shows the current list but **cannot change it**: whatever the settings route sends for
+this key is ignored, and saving a URL that is not on the list is refused on the spot.
+
+This answers a Comfy Registry finding (SSRF). If the settings route could point the API URL
+anywhere, whoever reaches it could make this ComfyUI process send the API key, the question
+and the images to any host and read the reply back. Now only the server's owner, through this
+file, decides where it may connect. For the same reason HTTP redirects are not followed (a 3xx
+is an error), and link-local addresses such as `169.254.*` are refused even when listed.
 
 ### Using a ComfyUI text encoder as the LLM
 
