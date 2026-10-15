@@ -27,6 +27,7 @@ import mimetypes
 import os
 import re
 import secrets
+import socket
 import tempfile
 import threading
 import time
@@ -53,14 +54,26 @@ _ROUTE_TOKEN = secrets.token_urlsafe(32)
 LOG_PREFIX = "LLM Widget: "
 
 FORMAT_OPENAI = "openai"
+# OpenAI's Responses API: the same servers as `openai`, but a different
+# endpoint, request shape and reply shape, which is why it is a format and not
+# a spelling of the URL. The system prompt goes as `instructions`, the turns as
+# `input` items, an image as an `input_image` part.
+FORMAT_RESPONSES = "responses"
 FORMAT_GEMINI = "gemini"
 FORMAT_GGUF = "gguf"
 # A text encoder in ComfyUI's own safetensors format, run through comfy's
 # `CLIP.generate` — the encoder an image model already needs, used as the LLM.
 FORMAT_CLIP = "clip"
-FORMATS = (FORMAT_OPENAI, FORMAT_GEMINI, FORMAT_GGUF, FORMAT_CLIP)
+FORMATS = (FORMAT_OPENAI, FORMAT_RESPONSES, FORMAT_GEMINI, FORMAT_GGUF, FORMAT_CLIP)
+# The formats `_http_generate` serves: a remote call rather than a model this
+# process has to load.
+HTTP_FORMATS = (FORMAT_OPENAI, FORMAT_RESPONSES, FORMAT_GEMINI)
 # The two backends that run in this process and hold a model of their own.
 LOCAL_FORMATS = (FORMAT_GGUF, FORMAT_CLIP)
+# The formats the unload route has a server to ask: the two OpenAI shapes,
+# because the local servers behind them (LM Studio, Ollama) are the ones with a
+# management route. Gemini is a cloud endpoint with nothing to free.
+REMOTE_UNLOAD_FORMATS = (FORMAT_OPENAI, FORMAT_RESPONSES)
 
 # Ask the model not to reason, and drop any block it emits anyway.
 THINKING_OFF = "off"
@@ -98,8 +111,16 @@ DEFAULT_ALLOWED_API_URLS = (
     "https://generativelanguage.googleapis.com",
 )
 
+# The default of the `http_timeout` setting: how long one request to an HTTP
+# backend may go without an answer. A reasoning model behind a slow endpoint, or
+# a question with ten images attached, can legitimately run past any fixed
+# number, and the user is the one who knows how long their server needs. urllib
+# applies it to the connect and to each socket read separately, so it is "no
+# bytes for this long", not a cap on the whole exchange.
 HTTP_TIMEOUT_SECONDS = 600
-# Freeing a model is quick; a request that hangs here should not sit for the ten
+HTTP_TIMEOUT_MIN_SECONDS = 10
+HTTP_TIMEOUT_LIMIT_SECONDS = 7200
+# Freeing a model is quick; a request that hangs here should not sit for the
 # minutes a generation is allowed.
 UNLOAD_TIMEOUT_SECONDS = 60
 HTTP_MAX_OUTPUT_TOKENS = 50000
@@ -217,6 +238,7 @@ CONFIG_DEFAULTS = {
     "thinking": THINKING_OFF,
     "temperature": 0.35,
     "max_length": MAX_LENGTH_DEFAULT,
+    "http_timeout": HTTP_TIMEOUT_SECONDS,
     "continue_chat": False,
     "history_turns": HISTORY_TURNS_DEFAULT,
     "chat_blank_lines": True,
@@ -314,6 +336,9 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
         "thinking": thinking,
         "temperature": round(temperature, 3),
         "max_length": integer("max_length", MAX_LENGTH_DEFAULT, MAX_LENGTH_MIN, MAX_LENGTH_LIMIT),
+        "http_timeout": integer(
+            "http_timeout", HTTP_TIMEOUT_SECONDS, HTTP_TIMEOUT_MIN_SECONDS, HTTP_TIMEOUT_LIMIT_SECONDS,
+        ),
         "continue_chat": _as_bool(source.get("continue_chat"), False),
         "history_turns": integer("history_turns", HISTORY_TURNS_DEFAULT, HISTORY_TURNS_MIN, HISTORY_TURNS_LIMIT),
         "chat_blank_lines": _as_bool(source.get("chat_blank_lines"), True),
@@ -399,7 +424,7 @@ def _update_config(payload: Mapping[str, Any]) -> dict[str, Any]:
         # Refuse the URL at save time so the dialog says why, not the next ✦.
         # Only for the formats that use it: a stale URL under gguf is nobody's
         # problem and must not block saving the rest.
-        if normalized["api_format"] in (FORMAT_OPENAI, FORMAT_GEMINI) and normalized["api_url"]:
+        if normalized["api_format"] in HTTP_FORMATS and normalized["api_url"]:
             problem = _destination_problem(_normalize_base_url(normalized["api_url"]), normalized)
             if problem:
                 raise ValueError(problem)
@@ -569,7 +594,7 @@ def _urlopen(request: urllib.request.Request, timeout: float):
 # URL handling
 # --------------------------------------------------------------------------- #
 
-_KNOWN_ENDPOINT_SUFFIXES = ("/v1/chat/completions", "/chat/completions")
+_KNOWN_ENDPOINT_SUFFIXES = ("/v1/chat/completions", "/chat/completions", "/v1/responses", "/responses")
 _GEMINI_ENDPOINT_RE = re.compile(
     r"/(v1beta|v1)/models/[^/?:#]+?:(generateContent|streamGenerateContent)$",
     flags=re.I,
@@ -663,14 +688,16 @@ def _normalize_url(api_url: str, api_format: str, model: str) -> str:
     if api_format == FORMAT_GEMINI:
         return _normalize_gemini_url(api_url, model)
     base = _normalize_base_url(api_url)
-    if base.lower().endswith("/chat/completions"):
+    responses = api_format == FORMAT_RESPONSES
+    # A URL that already names this format's endpoint is taken as written. One
+    # naming the *other* OpenAI endpoint is a known suffix and comes off, so
+    # switching between the two formats does not mean retyping the URL.
+    if base.lower().endswith("/responses" if responses else "/chat/completions"):
         return base
     base = _strip_known_endpoint(base)
-    endpoint = "/v1/chat/completions"
-    if base.lower().endswith("/v1"):
+    endpoint = "/v1/responses" if responses else "/v1/chat/completions"
+    if base.lower().endswith(("/v1", "/v1beta")):
         endpoint = endpoint[3:]
-    elif base.lower().endswith("/v1beta"):
-        endpoint = "/chat/completions"
     return base + endpoint
 
 
@@ -903,10 +930,19 @@ def _asset_path(asset: Mapping[str, Any]) -> str | None:
 
 
 def _image_part(data: bytes, mime: str, api_format: str) -> dict[str, Any]:
+    """One encoded image in whatever shape the format expects.
+
+    The three HTTP formats spell the same thing three ways, and every media
+    builder has to produce it, so the spelling lives here. The local backends
+    take the chat-completions shape: their callers pass FORMAT_OPENAI.
+    """
     encoded = base64.b64encode(data).decode("ascii")
     if api_format == FORMAT_GEMINI:
         return {"inlineData": {"mimeType": mime, "data": encoded}}
-    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
+    data_url = f"data:{mime};base64,{encoded}"
+    if api_format == FORMAT_RESPONSES:
+        return {"type": "input_image", "image_url": data_url}
+    return {"type": "image_url", "image_url": {"url": data_url}}
 
 
 def _encode_pil(image, max_side: int = STILL_MAX_SIDE) -> bytes:
@@ -1389,6 +1425,13 @@ def _thinking_off_payload(api_format: str) -> dict[str, Any]:
     """
     if api_format == FORMAT_GEMINI:
         return {"generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}}
+    if api_format == FORMAT_RESPONSES:
+        # Nothing to send. `chat_template_kwargs` is a chat-completions
+        # extension the Responses API does not take, and that API keeps a
+        # model's reasoning in `reasoning` output items, which `_responses_text`
+        # never reads. The chat switch here would only buy every request a
+        # rejected first attempt.
+        return {}
     return {"chat_template_kwargs": {"enable_thinking": False, "reasoning_effort": REASONING_EFFORT}}
 
 
@@ -1402,11 +1445,110 @@ def _merge_payload(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[st
     return merged
 
 
+# LM Studio's OpenAI-compatible server answers this to an image whose data URL
+# it will not decode. It is not about base64 at all: the part *is* a base64 data
+# URL, but the server only decodes JPEG and PNG and says this for WebP
+# (lmstudio-bug-tracker #1752) — and a ComfyUI input is often WebP. So the
+# request is retried once with every image transcoded to JPEG.
+_IMAGE_REJECTED_RE = re.compile(r"must be a base ?64[ -]encoded image", flags=re.I)
+IMAGE_RETRY_JPEG_QUALITY = 90
+
+
+def _jpeg_data_url(url: str) -> str | None:
+    """`url` re-encoded as a JPEG data URL, or None when it already is one or cannot be read."""
+    text = str(url or "")
+    if not text.startswith("data:") or "," not in text:
+        return None
+    header, encoded = text.split(",", 1)
+    if ";base64" not in header:
+        return None
+    if header[5:].split(";", 1)[0].strip().lower() in ("image/jpeg", "image/jpg"):
+        return None
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(base64.b64decode(encoded)))
+        image.load()
+        if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+            # JPEG has no alpha; a transparent image is flattened onto white
+            # rather than onto the black `convert("RGB")` would give it.
+            rgba = image.convert("RGBA")
+            flattened = Image.new("RGB", image.size, (255, 255, 255))
+            flattened.paste(rgba, mask=rgba.split()[-1])
+            image = flattened
+        else:
+            image = image.convert("RGB")
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=IMAGE_RETRY_JPEG_QUALITY)
+    except Exception as exc:
+        logging.warning(LOG_PREFIX + "could not re-encode an image as JPEG (%s).", exc)
+        return None
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _payload_with_jpeg_images(payload: Any) -> tuple[Any, int]:
+    """A copy of the payload with every image part transcoded to JPEG, and how many changed.
+
+    Walks the two OpenAI shapes alike: chat completions carries
+    `{"type": "image_url", "image_url": {"url": ...}}`, the Responses API
+    `{"type": "input_image", "image_url": "..."}`. Parts already in JPEG are
+    left as they are, so a zero count means a retry would send the same bytes.
+    """
+    if isinstance(payload, list):
+        items = [_payload_with_jpeg_images(item) for item in payload]
+        return [item for item, _ in items], sum(count for _, count in items)
+    if not isinstance(payload, Mapping):
+        return payload, 0
+    kind = payload.get("type")
+    if kind == "image_url" and isinstance(payload.get("image_url"), Mapping):
+        replaced = _jpeg_data_url(str(payload["image_url"].get("url") or ""))
+        if replaced is None:
+            return dict(payload), 0
+        return {**payload, "image_url": {**payload["image_url"], "url": replaced}}, 1
+    if kind == "input_image" and isinstance(payload.get("image_url"), str):
+        replaced = _jpeg_data_url(payload["image_url"])
+        if replaced is None:
+            return dict(payload), 0
+        return {**payload, "image_url": replaced}, 1
+    result: dict[str, Any] = {}
+    total = 0
+    for key, value in payload.items():
+        result[key], count = _payload_with_jpeg_images(value)
+        total += count
+    return result, total
+
+
+def _http_timeout(settings: Mapping[str, Any]) -> float:
+    """The configured request timeout, clamped as the normalizer clamps it."""
+    try:
+        value = float(settings.get("http_timeout") or HTTP_TIMEOUT_SECONDS)
+    except (TypeError, ValueError):
+        value = float(HTTP_TIMEOUT_SECONDS)
+    return float(min(HTTP_TIMEOUT_LIMIT_SECONDS, max(HTTP_TIMEOUT_MIN_SECONDS, value)))
+
+
+def _timed_out(exc: BaseException) -> bool:
+    """Whether this is the socket timeout, bare or wrapped in a URLError."""
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+    return isinstance(getattr(exc, "reason", None), (socket.timeout, TimeoutError))
+
+
+def _timeout_error(timeout: float) -> RuntimeError:
+    # Name the setting: "timed out" alone does not say the limit is this
+    # pack's and can be raised.
+    return RuntimeError(
+        f"The request timed out after {int(timeout)} s with no answer from the server. "
+        "Raise \"Request timeout\" in the settings if the model needs longer."
+    )
+
+
 def _http_post(
     url: str,
     headers: Mapping[str, str],
     payload: Mapping[str, Any],
     extra: Mapping[str, Any],
+    timeout: float = HTTP_TIMEOUT_SECONDS,
 ) -> Any:
     """POST the payload, retrying without `extra` if the endpoint rejects it.
 
@@ -1414,27 +1556,103 @@ def _http_post(
     never heard of them answers 400 rather than ignoring them. Dropping them and
     trying again is better than failing outright — the output cleanup is still
     there to catch a tagged reasoning block.
+
+    The other retry is for the image format: a 400 matching `_IMAGE_REJECTED_RE`
+    means the server would not decode an image (LM Studio and WebP), so the
+    images are transcoded to JPEG once and the attempts start over from the
+    current one, because the switch was not what was rejected. A payload whose
+    images were already JPEG is not resent; the error is raised with the
+    explanation instead.
     """
-    attempts: list[Mapping[str, Any]] = [_merge_payload(payload, extra)] if extra else []
-    attempts.append(payload)
+
+    def plan(base: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        return ([_merge_payload(base, extra)] if extra else []) + [base]
+
+    attempts = plan(payload)
+    transcoded = False
     last: Exception | None = None
-    for index, body in enumerate(attempts):
+    index = 0
+    while index < len(attempts):
+        body = attempts[index]
+        index += 1
         request = urllib.request.Request(
             url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers=dict(headers), method="POST",
         )
         try:
-            with _urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            with _urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             last = RuntimeError(f"API error ({exc.code}): {detail[:1000]}")
-            if index + 1 < len(attempts) and exc.code in {400, 404, 422}:
+            if exc.code == 400 and _IMAGE_REJECTED_RE.search(detail):
+                if not transcoded:
+                    payload, changed = _payload_with_jpeg_images(payload)
+                    if changed:
+                        transcoded = True
+                        _log(
+                            "the endpoint rejected an image's format; re-encoding %d image(s) as JPEG and retrying",
+                            changed,
+                        )
+                        attempts = plan(payload)[index - 1:]
+                        index = 0
+                        continue
+                raise RuntimeError(
+                    f"{last} - the server accepts only JPEG or PNG images"
+                    + (" and rejected them even after they were re-encoded as JPEG" if transcoded else "")
+                ) from exc
+            if index < len(attempts) and exc.code in {400, 404, 422}:
                 _log("the endpoint rejected the thinking-off fields (%d); retrying without them", exc.code)
                 continue
             raise last from exc
         except urllib.error.URLError as exc:
+            if _timed_out(exc):
+                raise _timeout_error(timeout) from exc
             raise RuntimeError(f"Request failed: {exc.reason}") from exc
+        except (socket.timeout, TimeoutError) as exc:
+            # A read that stalls raises the bare socket error from inside the
+            # `with`, not a URLError.
+            raise _timeout_error(timeout) from exc
     raise last or RuntimeError("Request failed")
+
+
+def _responses_text(data: Any) -> str:
+    """The answer text of a Responses API reply.
+
+    `output_text` is the SDK's convenience field and some servers include it;
+    the wire shape is `output[]` message items whose `content[]` holds
+    `output_text` parts. Reasoning items have no `content` and are skipped,
+    which is what keeps a reasoning model's thinking out of the answer on this
+    format. A proxy that answers in the chat-completions shape is read too.
+    """
+    if not isinstance(data, Mapping):
+        return ""
+    direct = data.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct
+    chunks: list[str] = []
+    output = data.get("output")
+    if isinstance(output, list):
+        for item in output:
+            content = item.get("content") if isinstance(item, Mapping) else None
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, Mapping):
+                    continue
+                value = part.get("text")
+                if isinstance(value, str):
+                    chunks.append(value)
+                elif isinstance(value, Mapping) and isinstance(value.get("value"), str):
+                    chunks.append(value["value"])
+    if chunks:
+        return "".join(chunks)
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
+        message = choices[0].get("message")
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(content, str):
+            return content
+    return ""
 
 
 def _server_root(api_url: str) -> str:
@@ -1651,6 +1869,29 @@ def _http_generate(
             "contents": contents,
             "generationConfig": {"temperature": temperature, "maxOutputTokens": HTTP_MAX_OUTPUT_TOKENS},
         }
+    elif api_format == FORMAT_RESPONSES:
+        headers = {
+            "Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {api_key}",
+        }
+        # The system prompt is `instructions`, not an item; the history goes as
+        # plain-text turns like the chat shape's, and only the current question
+        # carries parts.
+        turns: list[dict[str, Any]] = [
+            {"role": message["role"], "content": message["content"]} for message in history
+        ]
+        turns.append({"role": "user", "content": [{"type": "input_text", "text": user_prompt}, *media_parts]})
+        payload = {
+            "model": model,
+            "input": turns,
+            # Nothing of this exchange is to be kept server-side: the log in the
+            # answer widget is the only conversation state there is.
+            "store": False,
+            "stream": False,
+            "temperature": temperature,
+            "max_output_tokens": HTTP_MAX_OUTPUT_TOKENS,
+        }
+        if system_prompt.strip():
+            payload["instructions"] = system_prompt
     else:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
         content: Any = [{"type": "text", "text": user_prompt}, *media_parts] if media_parts else user_prompt
@@ -1666,7 +1907,9 @@ def _http_generate(
             "temperature": temperature,
             "max_tokens": HTTP_MAX_OUTPUT_TOKENS,
         }
-    data = _http_post(url, headers, payload, _thinking_off_payload(api_format) if no_think else {})
+    data = _http_post(
+        url, headers, payload, _thinking_off_payload(api_format) if no_think else {}, timeout=_http_timeout(settings),
+    )
     if api_format == FORMAT_GEMINI:
         candidates = data.get("candidates") if isinstance(data, dict) else None
         if not isinstance(candidates, list) or not candidates:
@@ -1679,6 +1922,15 @@ def _http_generate(
         if not text.strip():
             finish = candidate.get("finishReason") or candidate.get("finish_reason") or "unknown"
             raise RuntimeError(f"Gemini API returned no text (finish reason: {finish})")
+    elif api_format == FORMAT_RESPONSES:
+        text = _responses_text(data)
+        if not text.strip() and isinstance(data, dict):
+            # A reply cut short says why in `incomplete_details`; "empty" alone
+            # would hide that the budget ran out.
+            details = data.get("incomplete_details")
+            reason = details.get("reason") if isinstance(details, dict) else None
+            if reason:
+                raise RuntimeError(f"The Responses API returned no text (incomplete: {reason})")
     else:
         message = ((data.get("choices") or [{}])[0].get("message", {}) or {}) if isinstance(data, dict) else {}
         content = message.get("content", "")
@@ -2963,9 +3215,10 @@ def _register_routes() -> bool:
     async def _unload_route(request):
         """Free the model the configured backend is holding.
 
-        For gguf that is this process's own cache; for an OpenAI-compatible
-        server it is a request to LM Studio's REST API. Gemini has nothing to
-        free, and the button is not shown for it.
+        For gguf that is this process's own cache; for the two OpenAI-shaped
+        formats it is a request to LM Studio's or Ollama's own management route
+        — the same servers answer both, so `responses` is included. Gemini has
+        nothing to free, and the button is not shown for it.
         """
         denied = refused(request)
         if denied is not None:
@@ -2986,7 +3239,7 @@ def _register_routes() -> bool:
                 if state == "unloaded":
                     _log("model unloaded")
                 return web.json_response({"ok": True, "unloaded": state == "unloaded"})
-            if api_format != FORMAT_OPENAI:
+            if api_format not in REMOTE_UNLOAD_FORMATS:
                 return web.json_response(
                     {"ok": False, "error": "This backend has no model to unload"}, status=400,
                 )

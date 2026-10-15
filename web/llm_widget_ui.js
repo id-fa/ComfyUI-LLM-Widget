@@ -28,14 +28,17 @@ const ANSWER_EVENT = "llm_widget/answer";
 const TOKEN_HEADER = "X-LLM-Widget-Token";
 
 const FORMAT_OPENAI = "openai";
+// OpenAI's Responses API: the same servers as `openai`, spoken in the other shape.
+const FORMAT_RESPONSES = "responses";
 const FORMAT_GEMINI = "gemini";
 const FORMAT_GGUF = "gguf";
 const FORMAT_CLIP = "clip";
-const FORMATS = [FORMAT_OPENAI, FORMAT_GEMINI, FORMAT_GGUF, FORMAT_CLIP];
+const FORMATS = [FORMAT_OPENAI, FORMAT_RESPONSES, FORMAT_GEMINI, FORMAT_GGUF, FORMAT_CLIP];
 // The two that run inside ComfyUI and hold a model of their own to unload.
 const LOCAL_FORMATS = [FORMAT_GGUF, FORMAT_CLIP];
 const FORMAT_LABELS = {
-    [FORMAT_OPENAI]: "OpenAI-compatible",
+    [FORMAT_OPENAI]: "OpenAI-compatible (chat completions)",
+    [FORMAT_RESPONSES]: "OpenAI Responses API",
     [FORMAT_GEMINI]: "Gemini",
     [FORMAT_GGUF]: "GGUF (llama-cpp-python)",
     [FORMAT_CLIP]: "ComfyUI text encoder (safetensors)",
@@ -66,6 +69,11 @@ const GGUF_MMPROJ_NONE = "none";
 const GGUF_CONTEXT_DEFAULT = 16384;
 const GGUF_CONTEXT_MIN = 512;
 const GGUF_CONTEXT_LIMIT = 1048576;
+// Mirrors HTTP_TIMEOUT_* in nodes.py: how long one request to an HTTP backend
+// may go without an answer.
+const HTTP_TIMEOUT_DEFAULT = 600;
+const HTTP_TIMEOUT_MIN = 10;
+const HTTP_TIMEOUT_LIMIT = 7200;
 
 // The system prompt tabs live in the node's properties, not in a widget, so the
 // widget list the server declares stays exactly what it was. Only the open
@@ -123,6 +131,7 @@ const SETTINGS_DEFAULTS = Object.freeze({
     thinking: THINKING_OFF,
     temperature: 0.35,
     max_length: MAX_LENGTH_DEFAULT,
+    http_timeout: HTTP_TIMEOUT_DEFAULT,
     continue_chat: false,
     history_turns: HISTORY_TURNS_DEFAULT,
     chat_blank_lines: true,
@@ -166,6 +175,10 @@ const TEXT = {
     apiKey: "API key",
     apiKeyStored: "stored - type to replace it",
     model: "Model",
+    httpTimeout: "Request timeout (seconds)",
+    httpTimeoutHint:
+        "How long the server may go without sending anything before the request is given up. The ✦ button "
+        + "and \"Generate on execute\" share it. Raise it for a reasoning model behind a slow endpoint.",
     temperature: "Temperature",
     maxLength: "Max answer tokens",
     ggufModel: "GGUF model",
@@ -217,6 +230,10 @@ const TEXT = {
         "Runs locally through llama-cpp-python. Reading an image needs a matching mmproj projector; "
         + "without one the model answers from text alone.",
     httpHint: "Any OpenAI-compatible /v1/chat/completions endpoint. The path is completed automatically.",
+    responsesHint:
+        "OpenAI's /v1/responses endpoint, or a server that mirrors it (LM Studio, llama.cpp server, vLLM). "
+        + "The path is completed automatically. A reasoning model's thinking stays in its own output items "
+        + "and is never shown, whatever Model thinking says.",
     geminiHint: "Google's native generateContent endpoint. Videos are sent whole instead of as sampled frames.",
     tabPrefix: "Prompt",
     tabAdd: "New system prompt tab",
@@ -270,6 +287,7 @@ function normalizeSettings(value) {
             : THINKING_OFF,
         temperature: clampNumber(source.temperature, SETTINGS_DEFAULTS.temperature, 0, 2, false),
         max_length: clampNumber(source.max_length, MAX_LENGTH_DEFAULT, MAX_LENGTH_MIN, MAX_LENGTH_LIMIT),
+        http_timeout: clampNumber(source.http_timeout, HTTP_TIMEOUT_DEFAULT, HTTP_TIMEOUT_MIN, HTTP_TIMEOUT_LIMIT),
         continue_chat: asBoolean(source.continue_chat, false),
         history_turns: clampNumber(source.history_turns, HISTORY_TURNS_DEFAULT, HISTORY_TURNS_MIN, HISTORY_TURNS_LIMIT),
         chat_blank_lines: asBoolean(source.chat_blank_lines, true),
@@ -770,6 +788,7 @@ async function openSettings() {
     );
     const temperature = makeNumberInput(settingsCache.temperature, 0, 2, 0.05);
     const maxLength = makeNumberInput(settingsCache.max_length, MAX_LENGTH_MIN, MAX_LENGTH_LIMIT, 16);
+    const httpTimeout = makeNumberInput(settingsCache.http_timeout, HTTP_TIMEOUT_MIN, HTTP_TIMEOUT_LIMIT, 10);
     const historyTurns = makeNumberInput(settingsCache.history_turns, HISTORY_TURNS_MIN, HISTORY_TURNS_LIMIT, 1);
     const ggufContext = makeNumberInput(settingsCache.gguf_context, GGUF_CONTEXT_MIN, GGUF_CONTEXT_LIMIT, 512);
     const ggufGpuLayers = makeNumberInput(settingsCache.gguf_gpu_layers, -1, 1024, 1);
@@ -804,6 +823,10 @@ async function openSettings() {
         + TEXT.apiUrlHintEdit;
     const apiKeyRow = makeRow(TEXT.apiKey, apiKey);
     const modelRow = makeRow(TEXT.model, model);
+    const httpTimeoutRow = makeRow(TEXT.httpTimeout, httpTimeout);
+    const httpTimeoutHint = document.createElement("p");
+    httpTimeoutHint.className = "llmw-hint";
+    httpTimeoutHint.textContent = TEXT.httpTimeoutHint;
     const thinkingRow = makeRow(TEXT.thinking, thinking);
     const thinkingHint = document.createElement("p");
     thinkingHint.className = "llmw-hint";
@@ -837,6 +860,8 @@ async function openSettings() {
         apiUrlHint,
         apiKeyRow,
         modelRow,
+        httpTimeoutRow,
+        httpTimeoutHint,
         ggufModelRow,
         ggufMmprojRow,
         ggufContextRow,
@@ -906,8 +931,11 @@ async function openSettings() {
     const syncFormatRows = () => {
         const gguf = apiFormat.value === FORMAT_GGUF;
         const gemini = apiFormat.value === FORMAT_GEMINI;
+        const responses = apiFormat.value === FORMAT_RESPONSES;
         const clip = apiFormat.value === FORMAT_CLIP;
-        for (const row of [apiUrlRow, apiUrlHint, apiKeyRow, modelRow]) row.hidden = gguf || clip;
+        for (const row of [apiUrlRow, apiUrlHint, apiKeyRow, modelRow, httpTimeoutRow, httpTimeoutHint]) {
+            row.hidden = gguf || clip;
+        }
         for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadRow]) row.hidden = !gguf;
         for (const row of [clipModelRow, clipUnloadRow]) row.hidden = !clip;
         // Describing media one at a time only means something once media is sent.
@@ -919,7 +947,11 @@ async function openSettings() {
         // questions once there is a log at all.
         historyTurnsRow.hidden = !continueChat.checked;
         chatBlankLinesRow.hidden = !continueChat.checked;
-        hint.textContent = gguf ? TEXT.ggufHint : clip ? TEXT.clipHint : gemini ? TEXT.geminiHint : TEXT.httpHint;
+        hint.textContent = gguf ? TEXT.ggufHint
+            : clip ? TEXT.clipHint
+            : gemini ? TEXT.geminiHint
+            : responses ? TEXT.responsesHint
+            : TEXT.httpHint;
         apiUrl.placeholder = gemini ? "https://generativelanguage.googleapis.com" : "http://127.0.0.1:1234/v1";
         if (gguf) refreshGgufOptions();
         if (clip) refreshClipOptions();
@@ -952,6 +984,7 @@ async function openSettings() {
         thinking: thinking.value,
         temperature: temperature.value,
         max_length: maxLength.value,
+        http_timeout: httpTimeout.value,
         continue_chat: continueChat.checked,
         history_turns: historyTurns.value,
         chat_blank_lines: chatBlankLines.checked,

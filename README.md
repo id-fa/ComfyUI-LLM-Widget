@@ -13,8 +13,9 @@
 主な用途は、生成用プロンプトの下書きや書き直し、プロンプトの翻訳、参考画像の説明、
 あるいは単に画像を添えて質問すること。
 
-バックエンドは、OpenAI 互換の `/v1/chat/completions` エンドポイント、Google 純正の Gemini
-`generateContent`、または `llama-cpp-python` 経由のローカル GGUF の 3 つです。
+バックエンドは、OpenAI 互換の `/v1/chat/completions` エンドポイント、OpenAI の Responses API
+（`/v1/responses`）、Google 純正の Gemini `generateContent`、または `llama-cpp-python` 経由の
+ローカル GGUF です。
 
 ## インストール
 
@@ -151,10 +152,11 @@ Reroute ノードは辿って追跡します。
 
 | 設定 | 対象 | 意味 |
 | --- | --- | --- |
-| API format | 全て | `OpenAI-compatible`、`Gemini`、`GGUF`、`ComfyUI text encoder` |
-| API URL | openai / gemini | パスは自動補完されます。`http://host:1234`、`.../v1`、完全な `/v1/chat/completions` のいずれでも可。送信先は下記の `allowed_api_urls` にあるものだけ |
-| API key | openai / gemini | `Authorization: Bearer` / `x-goog-api-key` として送信 |
-| Model | openai / gemini | Gemini では id 単体、`models/<id>`、モデルの完全な URL のいずれでも可 |
+| API format | 全て | `OpenAI-compatible (chat completions)`、`OpenAI Responses API`、`Gemini`、`GGUF`、`ComfyUI text encoder` |
+| API URL | openai / responses / gemini | パスは自動補完されます。`http://host:1234`、`.../v1`、完全な `/v1/chat/completions` や `/v1/responses` のいずれでも可（形式を切り替えても打ち直し不要）。送信先は下記の `allowed_api_urls` にあるものだけ |
+| API key | openai / responses / gemini | `Authorization: Bearer` / `x-goog-api-key` として送信 |
+| Model | openai / responses / gemini | Gemini では id 単体、`models/<id>`、モデルの完全な URL のいずれでも可 |
+| Request timeout (seconds) | openai / responses / gemini | サーバーが何も返さないまま待つ上限（10〜7200、既定 600）。✦ と `generate_on_execute` で共通 — *リクエストのタイムアウト* を参照 |
 | GGUF model | gguf | スキャン対象フォルダで見つかった `.gguf` |
 | Vision projector | gguf | `auto` はモデルの隣の最初の `mmproj*.gguf` を使用。`none` はテキストのみに固定 |
 | Context size | gguf | `n_ctx` |
@@ -173,7 +175,7 @@ Reroute ノードは辿って追跡します。
 
 ### 送信先の許可リスト（`allowed_api_urls`）
 
-HTTP バックエンド（openai / gemini）への要求は、`llm_widget.json` の `allowed_api_urls` に
+HTTP バックエンド（openai / responses / gemini）への要求は、`llm_widget.json` の `allowed_api_urls` に
 載っている送信先にしか送られません。比較は **スキーム・ホスト・ポート**（オリジン）単位で、
 パスは見ません。`127.0.0.1`、`::1`、`localhost` は同じものとして扱います。既定値:
 
@@ -309,7 +311,7 @@ IME も、リサイズも、undo も今までどおり効きます。ワーク�
 オフにしている場合、⏏ がそれを解放する手段です。生成中は ⏏ が無効になり、サーバー側も実行中の
 解放要求を拒否します — 生成中の `Llama` を閉じると llama-cpp ごと落ちるためです。
 
-**openai** — ローカルサーバーに解放を依頼します。宛先は設定の API URL から導出します
+**openai / responses** — ローカルサーバーに解放を依頼します。宛先は設定の API URL から導出します
 （`http://127.0.0.1:1234/v1/chat/completions` → `http://127.0.0.1:1234`）。どのサーバーかは
 **設定させず、常駐モデルの一覧で自動判別**します:
 
@@ -337,7 +339,9 @@ IME も、リサイズも、undo も今までどおり効きます。ワーク�
 すべて載ります。OpenAI 互換サーバーには `chat_template_kwargs.enable_thinking=false`、
 Gemini には `thinkingConfig.thinkingBudget=0`、Qwen 系には `/no_think`。未知のフィールドを
 拒否するエンドポイントに対しては、それを外してもう一度送るので、厳格な API でもちゃんと答えが
-返ります。
+返ります。Responses API にはスイッチを送りません。`chat_template_kwargs` は chat completions の
+拡張で Responses API は受け付けず、推論は別の `reasoning` 出力アイテムに入るため、答えの
+テキストには元々含まれないからです。
 
 GGUF ではスイッチを **モデル自身のチャットテンプレートの中** で立てます。メディアを含まない
 ターンは、GGUF の `tokenizer.chat_template` の先頭に `enable_thinking = false` と
@@ -376,6 +380,47 @@ Qwen3.8 はオン／オフのスイッチを **深さ** に変えました。テ
 （` ``` `、` ```text `、` ```prompt `）のときだけです。` ```python ` のブロックは書かれたまま
 残すので、コードを頼めばコードがそのまま得られます。
 
+### OpenAI Responses API
+
+API format を `OpenAI Responses API` にすると、`/v1/chat/completions` の代わりに `/v1/responses` へ
+送ります。OpenAI 本家のほか、LM Studio、llama.cpp server、vLLM など同じ形を話すサーバーでも
+使えます。システムプロンプトは `instructions`、会話は `input` のメッセージ、画像は
+`input_image` パーツ、答えは `output` の `output_text` から取り出します。`store: false` を
+付けるので、サーバー側に会話は残りません — 会話の状態は answer 欄のログだけです。URL の
+補完は chat completions と同じで、`.../v1/chat/completions` と書いてあっても `/v1/responses` に
+付け替えます。⏏ も同じサーバーに対して同じ手順で動きます。
+
+### リクエストのタイムアウト
+
+HTTP バックエンド（openai / responses / gemini）への要求は、以前は 600 秒固定で打ち切って
+いました。遅いエンドポイントの先にいる推論モデルや、画像を 10 枚添えた質問は、それより長く
+かかっても正当です。⚙ の **Request timeout (seconds)**（`llm_widget.json` の `http_timeout`、
+10〜7200、既定 600）で変えられます。✦ と `generate_on_execute` で同じ値を使います。これは
+「サーバーが何も送ってこない時間」の上限で、接続と各読み取りに別々に適用されるため、やり取り
+全体の上限ではありません。超えたときは設定名を挙げたエラーになります。⏏ は管理用の呼び出し
+なので、別の短い上限のままです。
+
+### LM Studio が画像を拒否したとき（WebP → JPEG）
+
+LM Studio の OpenAI 互換サーバーは、デコードできない画像に対して
+
+```
+400 'url' field must be a base64 encoded image
+```
+
+を返します。文面は紛らわしいのですが、送っている画像は base64 のデータ URL そのもので、
+問題は **画像形式** です。LM Studio は JPEG と PNG しかデコードせず、WebP にこのエラーを返します
+（[lmstudio-bug-tracker #1752](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1752)）。
+ComfyUI の入力画像は WebP であることが珍しくありません。
+
+API format が `openai` または `responses` のとき、本文がこのメッセージに一致する 400 が返ると、
+添付した画像をすべて JPEG（品質 90、透明部分は白で埋める）に変換して一度だけ送り直します。
+thinking スイッチの再試行は失敗したステップから続けます — 拒否されたのはスイッチではないからです。
+すでに JPEG だった画像は変換しないので、変換できるものが無かったときや、JPEG でも拒否された
+ときは、その旨を付けたエラーになります。動画から取り出した静止画は最初から JPEG なので、この
+再送は起きません。Gemini はファイルを MIME タイプ付きでそのまま送り、ローカル形式はパーツを
+自分でデコードするので、どちらも対象外です。
+
 ## 開発
 
 - Python の変更には ComfyUI の完全な再起動 が必要です。
@@ -406,8 +451,9 @@ a step.
 Typical uses: drafting or rewriting a generation prompt, translating one, describing a
 reference image, or just asking a question with a picture attached.
 
-Backends: an OpenAI-compatible `/v1/chat/completions` endpoint, Google's native Gemini
-`generateContent`, or a local GGUF through `llama-cpp-python`.
+Backends: an OpenAI-compatible `/v1/chat/completions` endpoint, OpenAI's Responses API
+(`/v1/responses`), Google's native Gemini `generateContent`, or a local GGUF through
+`llama-cpp-python`.
 
 ## Install
 
@@ -543,10 +589,11 @@ API key** and is gitignored.
 
 | Setting | Applies to | Meaning |
 | --- | --- | --- |
-| API format | all | `OpenAI-compatible`, `Gemini`, `GGUF`, or `ComfyUI text encoder` |
-| API URL | openai / gemini | The path is completed for you: `http://host:1234` , `.../v1` and a full `/v1/chat/completions` all work. Only a destination listed in `allowed_api_urls` (below) is ever contacted |
-| API key | openai / gemini | Sent as `Authorization: Bearer` / `x-goog-api-key` |
-| Model | openai / gemini | For Gemini a bare id, `models/<id>` or a full model URL are all accepted |
+| API format | all | `OpenAI-compatible (chat completions)`, `OpenAI Responses API`, `Gemini`, `GGUF`, or `ComfyUI text encoder` |
+| API URL | openai / responses / gemini | The path is completed for you: `http://host:1234` , `.../v1` and a full `/v1/chat/completions` or `/v1/responses` all work, and switching the format does not mean retyping it. Only a destination listed in `allowed_api_urls` (below) is ever contacted |
+| API key | openai / responses / gemini | Sent as `Authorization: Bearer` / `x-goog-api-key` |
+| Model | openai / responses / gemini | For Gemini a bare id, `models/<id>` or a full model URL are all accepted |
+| Request timeout (seconds) | openai / responses / gemini | How long the server may go without sending anything (10–7200, default 600). Shared by ✦ and `generate_on_execute` — see *Request timeout* |
 | GGUF model | gguf | Any `.gguf` found under the scanned folders |
 | Vision projector | gguf | `auto` picks the first `mmproj*.gguf` next to the model; `none` forces text-only |
 | Context size | gguf | `n_ctx` |
@@ -565,7 +612,7 @@ API key** and is gitignored.
 
 ### Allowed destinations (`allowed_api_urls`)
 
-A request to an HTTP backend (openai / gemini) is only sent to a destination listed under
+A request to an HTTP backend (openai / responses / gemini) is only sent to a destination listed under
 `allowed_api_urls` in `llm_widget.json`. The comparison is by **scheme, host and port** (the
 origin); the path does not matter, and `127.0.0.1`, `::1` and `localhost` count as the same
 host. The default:
@@ -708,7 +755,7 @@ after answering` off nothing ever frees it. ⏏ does. It is disabled while a gen
 running and the server refuses the request too: closing a `Llama` that is still generating
 takes llama-cpp down with it.
 
-**openai** — asks the local server to free it. The address comes from the configured API URL
+**openai / responses** — asks the local server to free it. The address comes from the configured API URL
 (`http://127.0.0.1:1234/v1/chat/completions` → `http://127.0.0.1:1234`). Which server it is
 **is detected rather than configured**, by asking what it has resident:
 
@@ -737,7 +784,9 @@ With **Model thinking = Off** (the default) the request carries every switch the
 understand — `chat_template_kwargs.enable_thinking=false` for OpenAI-compatible servers,
 `thinkingConfig.thinkingBudget=0` for Gemini, `/no_think` for the Qwen family. An endpoint
 that rejects the unknown field gets the request again without it, so a stricter API still
-answers.
+answers. The Responses API gets no switch at all: `chat_template_kwargs` is a chat-completions
+extension it does not accept, and a model's reasoning lives in separate `reasoning` output
+items there, so it is never part of the answer text in the first place.
 
 For GGUF the switch is set **inside the model's own chat template**: a turn without media is
 rendered through llama-cpp's Jinja formatter over the GGUF's `tokenizer.chat_template` with
@@ -776,6 +825,50 @@ reasoning.
 A fenced answer is unwrapped only when the fence has no language or a prose-ish one
 (` ``` `, ` ```text `, ` ```prompt `). A ` ```python ` block is left exactly as written, so
 asking for code still gives you code.
+
+### OpenAI Responses API
+
+With the API format set to `OpenAI Responses API` the request goes to `/v1/responses` instead
+of `/v1/chat/completions`. That is OpenAI itself and any server that mirrors the shape (LM
+Studio, llama.cpp server, vLLM). The system prompt is sent as `instructions`, the conversation
+as `input` messages, images as `input_image` parts, and the answer is read from the
+`output_text` parts of `output`. `store: false` is set, so nothing of the exchange stays on the
+server — the log in the answer field is the only conversation state. The URL is completed the
+same way as for chat completions, and a URL that still says `.../v1/chat/completions` is
+rewritten to `/v1/responses`. ⏏ works against the same servers in the same way.
+
+### Request timeout
+
+A request to an HTTP backend (openai / responses / gemini) used to be cut off after a fixed
+600 s. A reasoning model behind a slow endpoint, or a question with ten images attached, can
+legitimately need longer. The limit is now **Request timeout (seconds)** in the ⚙ dialog
+(`http_timeout` in `llm_widget.json`, 10–7200, default 600), shared by ✦ and
+`generate_on_execute`. It is the time the server may go without sending anything — the
+connect and each read are timed separately — not a cap on the whole exchange. A request that
+hits it fails with a message that names the setting. ⏏ keeps its own short limit; it is a
+management call, not a generation.
+
+### Images LM Studio will not decode (WebP → JPEG)
+
+LM Studio's OpenAI-compatible server answers
+
+```
+400 'url' field must be a base64 encoded image
+```
+
+to an image it will not decode. The message is misleading: the images this node sends *are*
+base64 data URLs. What the server means is the image **format** — it decodes JPEG and PNG and
+says this for WebP
+([lmstudio-bug-tracker #1752](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1752)),
+and ComfyUI inputs are often WebP.
+
+With `openai` or `responses` as the API format, a `400` whose body matches that message makes
+the node transcode every attached image to JPEG (quality 90, transparency flattened onto white)
+and send the request once more. The thinking-switch retry resumes from the step that failed,
+since the switch was not what was rejected. Images that were already JPEG are not re-encoded;
+if nothing could be, or the server rejects the JPEGs too, the error says so. Sampled video
+frames are JPEG already and never trigger this. Gemini takes the file whole with its own MIME
+type and the local formats decode the parts themselves, so neither is affected.
 
 ## Development
 

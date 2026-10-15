@@ -155,10 +155,12 @@ keeps thinning it evenly. Gemini never uses any of this: it takes the file whole
 `_generate` is the single entry point shared by the route and by execution. It takes
 already-resolved `media_items`, so neither caller knows about the other's media source.
 
-- **openai / gemini** (`_http_generate`) — one `urllib` POST. URL handling is forgiving
-  (`_normalize_url` appends/strips endpoints, injects the Gemini model path). `_remote_unload`
-  is the one other thing spoken to an OpenAI-compatible server, and it is *not* an
-  OpenAI-compatible route: it is LM Studio's own REST API (`/api/v1/models/unload`) or Ollama's
+- **openai / responses / gemini** (`_http_generate`, the `HTTP_FORMATS`) — one `urllib` POST
+  through `_http_post`. URL handling is forgiving (`_normalize_url` appends/strips endpoints,
+  injects the Gemini model path; `/v1/responses` and `/v1/chat/completions` are both known
+  suffixes, so a URL typed for one format works under the other). `_remote_unload`
+  is the one other thing spoken to an OpenAI-compatible server (both OpenAI shapes:
+  `REMOTE_UNLOAD_FORMATS`), and it is *not* an OpenAI-compatible route: it is LM Studio's own REST API (`/api/v1/models/unload`) or Ollama's
   `keep_alive: 0` on `/api/generate`, both rooted by `_server_root`, which is why the `/v1` has
   to come off. Which server it is comes from the listing probes (`/api/v1/models` vs
   `/api/ps`) — neither has the other's route, so the one that answers is the answer. That
@@ -166,6 +168,28 @@ already-resolved `media_items`, so neither caller knows about the other's media 
   generate through the same endpoint, and one button is not worth tripling the settings, the
   validation and the format rows in the dialog. If a server ever answers both probes, add an
   override *inside* the openai format instead.
+- **responses** is a format and not a URL spelling because the request and reply shapes differ:
+  `instructions` for the system prompt, `input` messages (history as plain-text turns, the
+  current question as `input_text` + `input_image` parts from `_image_part`), `max_output_tokens`,
+  `store: false`, and the answer read by `_responses_text` from `output[].content[].text`
+  (reasoning items have no `content` and are skipped; a chat-shaped `choices` reply is read as a
+  fallback). `_thinking_off_payload` returns `{}` for it: `chat_template_kwargs` is a
+  chat-completions extension the API rejects, and sending it would cost every request a 400 and
+  a retry. A reply with no text but `incomplete_details.reason` reports the reason.
+- **`http_timeout`** (10–7200 s, default `HTTP_TIMEOUT_SECONDS`) is the one timeout for the HTTP
+  formats, read through `_http_timeout` and passed to `_http_post` — the ✦ route and
+  `generate_on_execute` share it; do not reintroduce a second constant. urllib applies it per
+  connect and per read, and a read that stalls raises the bare `socket.timeout` from inside the
+  `with`, not a `URLError`, so `_http_post` catches both and reports a message naming the setting.
+  `UNLOAD_TIMEOUT_SECONDS` stays separate because unloading is a management call.
+- **`_http_post` has a second retry besides the thinking-switch one**: a 400 matching
+  `_IMAGE_REJECTED_RE` (`'url' field must be a base64 encoded image`) is LM Studio refusing the
+  image *format*, not the encoding — the parts are already base64 data URLs; it decodes JPEG/PNG
+  and says this for WebP, which ComfyUI inputs often are. `_payload_with_jpeg_images` transcodes
+  every `image_url` / `input_image` part to JPEG once and the attempts restart from the step that
+  failed. Zero transcoded parts means the same bytes would be resent, so it raises instead. Do not
+  pre-convert every image to JPEG to avoid the retry: cloud endpoints take WebP/PNG fine and a
+  lossy re-encode of every image is not free.
 - **gguf** (`_gguf_generate`) — `llama-cpp-python`. The loaded `Llama` is cached in `_GGUF_STATE`
   keyed by `(model, mmproj, ctx, gpu_layers)` and released when that changes, on
   `gguf_unload_after`, on cancel, or from the toolbar's ⏏ (`POST /llm_widget/unload`). Vision
@@ -426,7 +450,7 @@ node.properties["llmw_system_tab_index"] = open tab
 `SAVED_WIDGETS` in the JS must list the widgets of `INPUT_TYPES` in the same order.
 
 Constants duplicated between `nodes.py` and `web/llm_widget_ui.js` must be edited in both: the
-route paths under `/llm_widget/`, `ANSWER_EVENT`, `TOKEN_HEADER`, the four format ids and `LOCAL_FORMATS`, `GGUF_MMPROJ_AUTO` /
+route paths under `/llm_widget/`, `ANSWER_EVENT`, `TOKEN_HEADER`, the five format ids and `LOCAL_FORMATS`, `GGUF_MMPROJ_AUTO` /
 `GGUF_MMPROJ_NONE`, `CHAT_USER_MARK` / `CHAT_MODEL_MARK`, the `VIDEO_SAMPLES` ids, `IMAGE_INPUT_MAX` with the socket
 naming (`image`, `image2`, …), and every
 settings key with its clamp range (both sides normalize independently, and the server's
