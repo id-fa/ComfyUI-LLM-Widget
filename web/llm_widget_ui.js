@@ -214,7 +214,8 @@ const TEXT = {
     loadFailed: "Could not load the settings",
     failed: "LLM Widget",
     cancelled: "Generation stopped",
-    missingHttp: "Set the API URL, key and model in the settings first",
+    missingHttp: "Set the API URL and model in the settings first",
+    missingGemini: "Set the API URL, key and model in the settings first",
     missingGguf: "Select a GGUF model in the settings first",
     missingClip: "Select a text encoder in the settings first",
     clipEmpty: "No .safetensors found under models/text_encoders",
@@ -1430,7 +1431,10 @@ function releaseRowSizing(node) {
 function isConfigured() {
     if (settingsCache.api_format === FORMAT_GGUF) return Boolean(settingsCache.gguf_model.trim());
     if (settingsCache.api_format === FORMAT_CLIP) return Boolean(settingsCache.clip_model.trim());
-    return Boolean(settingsCache.api_url.trim() && settingsCache.model.trim() && settingsCache.api_key_set);
+    // The key is optional for the OpenAI-shaped formats - a local server usually
+    // has none - and required by Gemini, which authenticates by nothing else.
+    const keyOk = settingsCache.api_format !== FORMAT_GEMINI || settingsCache.api_key_set;
+    return Boolean(settingsCache.api_url.trim() && settingsCache.model.trim() && keyOk);
 }
 
 function clearStatusTimer(node) {
@@ -1631,7 +1635,12 @@ async function generate(node) {
         return;
     }
     if (!isConfigured()) {
-        notify({ [FORMAT_GGUF]: TEXT.missingGguf, [FORMAT_CLIP]: TEXT.missingClip }[settingsCache.api_format] || TEXT.missingHttp, "warn");
+        notify(
+            { [FORMAT_GGUF]: TEXT.missingGguf, [FORMAT_CLIP]: TEXT.missingClip, [FORMAT_GEMINI]: TEXT.missingGemini }[
+                settingsCache.api_format
+            ] || TEXT.missingHttp,
+            "warn",
+        );
         openSettings();
         return;
     }

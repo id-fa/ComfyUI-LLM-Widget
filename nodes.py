@@ -1870,9 +1870,9 @@ def _http_generate(
             "generationConfig": {"temperature": temperature, "maxOutputTokens": HTTP_MAX_OUTPUT_TOKENS},
         }
     elif api_format == FORMAT_RESPONSES:
-        headers = {
-            "Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {api_key}",
-        }
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         # The system prompt is `instructions`, not an item; the history goes as
         # plain-text turns like the chat shape's, and only the current question
         # carries parts.
@@ -1893,7 +1893,11 @@ def _http_generate(
         if system_prompt.strip():
             payload["instructions"] = system_prompt
     else:
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        # No key means no header at all: `Bearer ` with nothing after it is a
+        # malformed credential some servers reject outright.
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         content: Any = [{"type": "text", "text": user_prompt}, *media_parts] if media_parts else user_prompt
         messages: list[dict[str, Any]] = []
         if system_prompt.strip():
@@ -3103,10 +3107,14 @@ def _validate(settings: Mapping[str, Any]) -> str:
         return ""
     if api_format == FORMAT_CLIP:
         return "" if str(settings.get("clip_model") or "").strip() else "Select a text encoder in the settings"
-    missing = [
-        name for name, key in (("API URL", "api_url"), ("model", "model"), ("API key", "api_key"))
-        if not str(settings.get(key) or "").strip()
-    ]
+    # A key is optional for the OpenAI-shaped formats: a local server (LM
+    # Studio, Ollama, llama-server) usually has none, and the header is simply
+    # left out. Gemini has no such mode - `x-goog-api-key` is the only
+    # authentication it knows.
+    required = [("API URL", "api_url"), ("model", "model")]
+    if api_format == FORMAT_GEMINI:
+        required.append(("API key", "api_key"))
+    missing = [name for name, key in required if not str(settings.get(key) or "").strip()]
     if missing:
         return f"The settings are incomplete: {', '.join(missing)} required"
     try:

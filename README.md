@@ -154,7 +154,7 @@ Reroute ノードは辿って追跡します。
 | --- | --- | --- |
 | API format | 全て | `OpenAI-compatible (chat completions)`、`OpenAI Responses API`、`Gemini`、`GGUF`、`ComfyUI text encoder` |
 | API URL | openai / responses / gemini | パスは自動補完されます。`http://host:1234`、`.../v1`、完全な `/v1/chat/completions` や `/v1/responses` のいずれでも可（形式を切り替えても打ち直し不要）。送信先は下記の `allowed_api_urls` にあるものだけ |
-| API key | openai / responses / gemini | `Authorization: Bearer` / `x-goog-api-key` として送信 |
+| API key | openai / responses / gemini | `Authorization: Bearer` / `x-goog-api-key` として送信。openai / responses では省略可（ローカルサーバー向け。空ならヘッダー自体を送りません）、Gemini では必須 |
 | Model | openai / responses / gemini | Gemini では id 単体、`models/<id>`、モデルの完全な URL のいずれでも可 |
 | Request timeout (seconds) | openai / responses / gemini | サーバーが何も返さないまま待つ上限（10〜7200、既定 600）。✦ と `generate_on_execute` で共通 — *リクエストのタイムアウト* を参照 |
 | GGUF model | gguf | スキャン対象フォルダで見つかった `.gguf` |
@@ -598,7 +598,7 @@ API key** and is gitignored.
 | --- | --- | --- |
 | API format | all | `OpenAI-compatible (chat completions)`, `OpenAI Responses API`, `Gemini`, `GGUF`, or `ComfyUI text encoder` |
 | API URL | openai / responses / gemini | The path is completed for you: `http://host:1234` , `.../v1` and a full `/v1/chat/completions` or `/v1/responses` all work, and switching the format does not mean retyping it. Only a destination listed in `allowed_api_urls` (below) is ever contacted |
-| API key | openai / responses / gemini | Sent as `Authorization: Bearer` / `x-goog-api-key` |
+| API key | openai / responses / gemini | Sent as `Authorization: Bearer` / `x-goog-api-key`. Optional for openai / responses (a local server usually has none; empty means no header at all), required for Gemini |
 | Model | openai / responses / gemini | For Gemini a bare id, `models/<id>` or a full model URL are all accepted |
 | Request timeout (seconds) | openai / responses / gemini | How long the server may go without sending anything (10–7200, default 600). Shared by ✦ and `generate_on_execute` — see *Request timeout* |
 | GGUF model | gguf | Any `.gguf` found under the scanned folders |
