@@ -315,6 +315,15 @@ let routeToken = "";
  * gets a 403 on its first call: the settings are fetched again, which renews
  * the token, and the call is repeated once.
  */
+// ComfyUI frontend 1.55+ gives `api.fetchApi` its own 60 s timeout and aborts
+// the request with a `TimeoutError` DOMException whose message is "Fetch
+// timeout". Generating and unloading take as long as the model takes, and the
+// server already has the timeout the user configured (`http_timeout`), so the
+// calls that wait on a model disable the frontend's: `timeoutMs: null` is the
+// documented opt-out, and an older frontend hands the unknown option to
+// `fetch`, which ignores it.
+const LONG_CALL = Object.freeze({ timeoutMs: null });
+
 async function callRoute(endpoint, options = {}, retry = true) {
     if (!routeToken) await loadSettings({ force: true }).catch(() => {});
     const response = await api.fetchApi(endpoint, {
@@ -1642,6 +1651,7 @@ async function generate(node) {
     try {
         const response = await callRoute(GENERATE_ENDPOINT, {
             method: "POST",
+            ...LONG_CALL,
             headers: { "Content-Type": "application/json" },
             signal: controller?.signal,
             body: JSON.stringify({
@@ -1699,7 +1709,7 @@ async function unloadModel(node) {
     if (!button || button.disabled) return;
     button.disabled = true;
     try {
-        const response = await callRoute(UNLOAD_ENDPOINT, { method: "POST" });
+        const response = await callRoute(UNLOAD_ENDPOINT, { method: "POST", ...LONG_CALL });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
         // `detail` carries the server's own wording, e.g. which models it does

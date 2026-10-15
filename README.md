@@ -400,6 +400,13 @@ HTTP バックエンド（openai / responses / gemini）への要求は、以前
 全体の上限ではありません。超えたときは設定名を挙げたエラーになります。⏏ は管理用の呼び出し
 なので、別の短い上限のままです。
 
+**ブラウザ側にも、もう一つ短い上限がありました。** ComfyUI フロントエンド 1.55 以降の
+`api.fetchApi` には独自の 60 秒タイムアウトがあり、超えると `Fetch timeout` というエラーで
+要求を中断します。600 秒に設定しても 1 分で切れていたのはこれで、サーバー側は気づかずに生成を
+続けていました。✦ と ⏏ の呼び出しはこの上限を外す（`timeoutMs: null`）ようにしたので、
+効くのはサーバー側の `http_timeout` だけになります。古いフロントエンドではこのオプションは
+無視されます。
+
 ### LM Studio が画像を拒否したとき（WebP → JPEG）
 
 LM Studio の OpenAI 互換サーバーは、デコードできない画像に対して
@@ -847,6 +854,12 @@ legitimately need longer. The limit is now **Request timeout (seconds)** in the 
 connect and each read are timed separately — not a cap on the whole exchange. A request that
 hits it fails with a message that names the setting. ⏏ keeps its own short limit; it is a
 management call, not a generation.
+
+**The browser had a second, shorter limit.** ComfyUI frontend 1.55 and later give
+`api.fetchApi` a 60 s timeout of its own and abort the request with a `Fetch timeout` error —
+which is what a 600 s setting still ran into after one minute, while the server went on
+generating. The ✦ and ⏏ calls now opt out of that limit (`timeoutMs: null`), so the server's
+`http_timeout` is the only one. An older frontend ignores the option.
 
 ### Images LM Studio will not decode (WebP → JPEG)
 

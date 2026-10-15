@@ -181,7 +181,11 @@ already-resolved `media_items`, so neither caller knows about the other's media 
   `generate_on_execute` share it; do not reintroduce a second constant. urllib applies it per
   connect and per read, and a read that stalls raises the bare `socket.timeout` from inside the
   `with`, not a `URLError`, so `_http_post` catches both and reports a message naming the setting.
-  `UNLOAD_TIMEOUT_SECONDS` stays separate because unloading is a management call.
+  `UNLOAD_TIMEOUT_SECONDS` stays separate because unloading is a management call. **The frontend
+  has a timeout of its own**: ComfyUI frontend 1.55+ aborts `api.fetchApi` after 60 s (`Fetch
+  timeout`, a `TimeoutError` DOMException), so the `generate` and `unload` calls pass `LONG_CALL`
+  (`timeoutMs: null`) and the server's limit is the only one; a new long-running route call must do
+  the same, or it dies at a minute whatever `http_timeout` says.
 - **`_http_post` has a second retry besides the thinking-switch one**: a 400 matching
   `_IMAGE_REJECTED_RE` (`'url' field must be a base64 encoded image`) is LM Studio refusing the
   image *format*, not the encoding — the parts are already base64 data URLs; it decodes JPEG/PNG
