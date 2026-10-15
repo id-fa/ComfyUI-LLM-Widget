@@ -1615,14 +1615,27 @@ def _http_post(
     raise last or RuntimeError("Request failed")
 
 
+def _is_reasoning_type(value: Any) -> bool:
+    """Whether a Responses API item or part type marks reasoning.
+
+    `reasoning` items, `reasoning_text` parts, and the `reasoning_summary*`
+    spellings some servers use.
+    """
+    return isinstance(value, str) and value.lower().startswith("reasoning")
+
+
 def _responses_text(data: Any) -> str:
     """The answer text of a Responses API reply.
 
     `output_text` is the SDK's convenience field and some servers include it;
     the wire shape is `output[]` message items whose `content[]` holds
-    `output_text` parts. Reasoning items have no `content` and are skipped,
-    which is what keeps a reasoning model's thinking out of the answer on this
-    format. A proxy that answers in the chat-completions shape is read too.
+    `output_text` parts. Reasoning is skipped wherever it appears, which is
+    what keeps a reasoning model's thinking out of the answer on this format:
+    `reasoning` items (whose `content`, when present, holds `reasoning_text`
+    parts) and `reasoning_text` parts inside a message item alike — a server
+    that puts the thought and the answer in the same `content[]` would
+    otherwise have them concatenated. A proxy that answers in the
+    chat-completions shape is read too.
     """
     if not isinstance(data, Mapping):
         return ""
@@ -1633,11 +1646,13 @@ def _responses_text(data: Any) -> str:
     output = data.get("output")
     if isinstance(output, list):
         for item in output:
-            content = item.get("content") if isinstance(item, Mapping) else None
+            if not isinstance(item, Mapping) or _is_reasoning_type(item.get("type")):
+                continue
+            content = item.get("content")
             if not isinstance(content, list):
                 continue
             for part in content:
-                if not isinstance(part, Mapping):
+                if not isinstance(part, Mapping) or _is_reasoning_type(part.get("type")):
                     continue
                 value = part.get("text")
                 if isinstance(value, str):

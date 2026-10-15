@@ -172,7 +172,8 @@ already-resolved `media_items`, so neither caller knows about the other's media 
   `instructions` for the system prompt, `input` messages (history as plain-text turns, the
   current question as `input_text` + `input_image` parts from `_image_part`), `max_output_tokens`,
   `store: false`, and the answer read by `_responses_text` from `output[].content[].text`
-  (reasoning items have no `content` and are skipped; a chat-shaped `choices` reply is read as a
+  (`reasoning` items and `reasoning_text` parts are skipped by type — a server may put the thought
+  and the answer in one message's `content[]`; a chat-shaped `choices` reply is read as a
   fallback). `_thinking_off_payload` returns `{}` for it: `chat_template_kwargs` is a
   chat-completions extension the API rejects, and sending it would cost every request a 400 and
   a retry. A reply with no text but `incomplete_details.reason` reports the reason.
