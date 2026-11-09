@@ -408,6 +408,12 @@ the frontend has the same defect plus a frontend-version one.
 the callback, because which of those a multiline widget actually reads differs across ComfyUI
 frontend versions.
 
+The frontend hides a widget whose input slot is linked. That is its behaviour for every node and
+is not fought here; what the node adds is `syncLinkedLine`, a line in the toolbar naming the linked
+`LINKED_TEXT_INPUTS` and saying that ✦ sends the stored text while the link is read only under
+`generate_on_execute` (the editor route runs without executing the graph, so the upstream value
+does not exist yet). Like the chips it is refreshed from `onDraw` by signature.
+
 ## System prompt tabs
 
 Ported from `ComfyUI-PromptPalette-F`'s Prompt Tabs by way of the MiniMax H3 Easy port, and

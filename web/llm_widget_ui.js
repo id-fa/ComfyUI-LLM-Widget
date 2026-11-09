@@ -245,7 +245,13 @@ const TEXT = {
     tabRenameHint: "Double-click to rename",
     mediaNoFile: "not a saved file - it will be skipped",
     mediaSkipped: "Could not read: ",
+    linkedHint:
+        " connected: ✦ sends the text stored in the node. The connected value is read during execution "
+        + "only - turn on Generate on execute.",
 };
+
+/** Text inputs whose link only matters during execution (see `syncLinkedLine`). */
+const LINKED_TEXT_INPUTS = ["system_prompt", "question"];
 
 let settingsCache = { ...SETTINGS_DEFAULTS };
 let settingsLoaded = false;
@@ -1500,6 +1506,30 @@ function syncAllNodes() {
 }
 
 /**
+ * Name the text inputs that have a link, and say what that means for ✦.
+ *
+ * The frontend hides a widget whose input is connected, so with `question` or
+ * `system_prompt` wired to another node the text box is gone and nothing on
+ * the node says what ✦ would send. It sends the stored text: the editor route
+ * runs without executing the graph, so the upstream value does not exist yet
+ * and only `generate_on_execute` ever sees it. Checked from onDraw like the
+ * chips, so a link made from either end is picked up without an event.
+ */
+function syncLinkedLine(node) {
+    const line = node?.__llmwLinked;
+    if (!line) return;
+    const inputs = node.inputs || [];
+    const linked = LINKED_TEXT_INPUTS.filter((name) =>
+        inputs.some((input) => String(input?.name || "") === name && input.link != null));
+    const signature = linked.join(",");
+    if (signature === node.__llmwLinkedSignature) return;
+    node.__llmwLinkedSignature = signature;
+    line.hidden = !linked.length;
+    line.textContent = linked.length ? `${linked.join(" / ")}${TEXT.linkedHint}` : "";
+    line.title = line.textContent;
+}
+
+/**
  * Rebuild the chips under the toolbar.
  *
  * Called from onDraw, so it first compares a cheap signature: the upstream
@@ -1574,6 +1604,9 @@ function installToolbar(node) {
     const media = document.createElement("div");
     media.className = "llmw-media";
     media.hidden = true;
+    const linked = document.createElement("div");
+    linked.className = "llmw-linked";
+    linked.hidden = true;
     // One button wide, so ✦ is not something the hand reaches by accident on
     // the way to ⏏ or ⧉. It sits before the run button rather than after a
     // particular neighbour, because ⏏ is hidden for Gemini.
@@ -1583,7 +1616,7 @@ function installToolbar(node) {
     // The status stretches so the buttons stay together in the bottom-right
     // corner of the node, with the run button in the corner itself.
     bar.append(status, settingsButton, clearButton, copyButton, unloadButton, gap, runButton);
-    wrap.append(media, bar);
+    wrap.append(linked, media, bar);
     // The canvas would otherwise zoom while the pointer sits over the toolbar.
     // Over the chips it scrolls them instead, when ten images and a video do
     // not fit: the row stays one line high, like the tab strip.
@@ -1600,10 +1633,13 @@ function installToolbar(node) {
     const widget = node.addDOMWidget("llmw_toolbar", "llmw_toolbar", wrap, {
         serialize: false,
         margin: 4,
-        getMinHeight: () => (media.hidden ? 30 : 52),
+        getMinHeight: () => 30 + (media.hidden ? 0 : 22) + (linked.hidden ? 0 : 20),
         getValue: () => "",
         setValue: () => {},
-        onDraw: () => syncMediaLine(node),
+        onDraw: () => {
+            syncLinkedLine(node);
+            syncMediaLine(node);
+        },
     });
     if (!widget) {
         wrap.remove();
@@ -1615,6 +1651,7 @@ function installToolbar(node) {
     node.__llmwUnload = unloadButton;
     node.__llmwStatus = status;
     node.__llmwMedia = media;
+    node.__llmwLinked = linked;
     node.__llmwToolbar = widget;
     // Added last and left there, which puts it under the question field — the
     // run and copy buttons end up in the node's bottom-right corner, where the
@@ -1807,6 +1844,7 @@ function installNode(nodeType, nodeData) {
     const onConnectionsChange = nodeType.prototype.onConnectionsChange;
     nodeType.prototype.onConnectionsChange = function () {
         const result = onConnectionsChange?.apply(this, arguments);
+        syncLinkedLine(this);
         syncMediaLine(this, { force: true });
         return result;
     };
@@ -1819,6 +1857,7 @@ function installNode(nodeType, nodeData) {
         // syncNode too: a workflow opened after the settings were already
         // fetched gets no other chance to pick up the continue-mode styling.
         syncNode(this);
+        syncLinkedLine(this);
         syncMediaLine(this, { force: true });
         return result;
     };
@@ -1858,6 +1897,11 @@ function installStyle() {
       .llmw-media { display: flex; flex-wrap: nowrap; gap: 4px; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
       .llmw-media::-webkit-scrollbar { display: none; }
       .llmw-media[hidden] { display: none !important; }
+      .llmw-linked {
+        min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        color: rgba(227,227,227,.5); font-size: 11px; line-height: 16px;
+      }
+      .llmw-linked[hidden] { display: none !important; }
       .llmw-chip {
         flex: 0 0 auto; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 7px; border: 1px solid rgba(255,255,255,.1);
         border-radius: 999px; background: rgba(255,255,255,.04); color: rgba(227,227,227,.6); font-size: 10px; line-height: 16px;

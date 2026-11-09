@@ -91,7 +91,10 @@ C:\AI\ComfyUI\python_embeded\python.exe -c "from llama_cpp.llama_chat_format imp
 
 - **toolbar** — ✦ 実行（リクエスト中は ■ 停止に変わる）、経過時間、⏏ モデルを解放（Gemini 以外で
   表示）、⧉ 答えをコピー、⌫ 会話を消去（continue モードのときだけ表示）、⚙ 設定。その上には、
-  接続したメディアごとに実際に送られるものを示すチップが並びます。
+  接続したメディアごとに実際に送られるものを示すチップが並びます。`question` や `system_prompt`
+  に別ノードの出力を繋ぐと ComfyUI はそのテキスト欄を隠すので、代わりに「接続中」の一行が出ます:
+  ✦ はノードに保存されているテキストを送り、繋いだ値が使われるのは `generate_on_execute`
+  での実行時だけです（下記 *実行時の動作*）。
 - **system_prompt** — 自由記述。ワークフローと一緒に保存されます。「テンプレート」と呼べるものは
   これだけです。すぐ上のタブで複数のシステムプロンプトを保存しておき、切り替えて使えます:
   クリックで切り替え、ダブルクリックで名前変更、`+` で追加、`×` で削除、開いているタブの
@@ -143,6 +146,11 @@ Reroute ノードは辿って追跡します。
 ヘッドレス実行や API 実行のときはオンにしてください。質問は実行中に、実際の `IMAGE` / `VIDEO`
 テンソルを使って（ファイルは不要）処理され、結果は出力に流れると同時にノードの `answer`
 ウィジェットにも書き戻されます。
+
+`question` や `system_prompt` を別ノードの出力から受け取るのもこのモードの話です。✦ はグラフを
+実行しないので、上流ノードの出力はその時点では存在せず、✦ が送るのはノードに保存されている
+テキストのままです。繋いだ値を読むのは実行時だけなので、`generate_on_execute` をオンにして
+ください。
 
 ## 設定
 
@@ -537,7 +545,10 @@ Widgets:
 - **toolbar** — ✦ run (becomes ■ stop while a request is in flight), elapsed time, ⏏ unload
   the model (shown for every backend but Gemini), ⧉ copy the answer, ⌫ clear the conversation
   (shown in continue mode only), ⚙ settings. Above it, a chip per connected media shows what
-  will actually be sent.
+  will actually be sent. When `question` or `system_prompt` is fed by another node, ComfyUI
+  hides the text box, so a "connected" line takes its place: ✦ sends the text stored in the
+  node, and the connected value is only read when the graph runs with `generate_on_execute`
+  (see *Execution* below).
 - **system_prompt** — free text, saved with the workflow. This is the only "template"
   there is. The tabs right above it keep several system prompts on the node: click to switch,
   double-click to rename, `+` to add, `×` to delete, `◀` `▶` on the open tab to reorder. Only
@@ -587,6 +598,11 @@ the editor.
 Turn it on for a headless or API run. The question is then answered during execution, using
 the actual `IMAGE`/`VIDEO` tensors (no file needed), and the result is pushed back into the
 node's `answer` widget as well as onto the output.
+
+Feeding `question` or `system_prompt` from another node belongs to this mode too. ✦ does not
+execute the graph, so the upstream output does not exist yet and ✦ keeps sending the text
+stored in the node. The connected value is read during execution only, so turn
+`generate_on_execute` on.
 
 ## Settings
 
