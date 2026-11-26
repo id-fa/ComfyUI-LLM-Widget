@@ -273,6 +273,13 @@ already-resolved `media_items`, so neither caller knows about the other's media 
     the executor does, so the cached model is usable from either.
   - `_CLIP_STATE` / `_clip_hold` / `_clip_unload_now` mirror the GGUF trio. Release goes through
     `unload_model_and_clones`; dropping the reference alone leaves the weights on the GPU.
+  - **`clip_mtp` (`auto` / `off`)** is the one knob taken from `Generate Text`'s `mtp` combo.
+    comfy's default is `mtp=True` (= `auto`), so `_clip_generate_options` passes nothing for it and
+    `{"mtp": False}` only for `off` — and only when `clip.generate`'s signature has the argument,
+    so a pre-0.45 ComfyUI keeps working. The fixed depths (`2`–`5`) and `tree*` modes were
+    deliberately not ported: they are benchmark knobs `auto` adapts past. MTP changes the sampled
+    text for the same seed, which is what `off` is for; it does nothing on an encoder without
+    `mtp.fc.weight` (Qwen3-VL and Gemma accept the argument and ignore it).
   - There is no describe mode and no mmproj here; do not port them.
 
 `gguf_describe_media` switches to a two-stage shape: `_gguf_describe` runs one small vision pass

@@ -83,6 +83,16 @@ THINKING_OFF = "off"
 THINKING_KEEP = "keep"
 THINKING_MODES = (THINKING_OFF, THINKING_KEEP)
 
+# Speculative decoding through the text encoder's multi-token-prediction head.
+# `auto` is comfy's default (`CLIP.generate(mtp=True)`, the Generate Text node's
+# `auto`): the draft depth adapts to observed matches. `off` is the way out when
+# the MTP path misbehaves or the pre-0.45 output for the same seed is wanted —
+# the sampled distribution is the same, the samples are not. No effect on an
+# encoder without `mtp.fc.weight`.
+CLIP_MTP_AUTO = "auto"
+CLIP_MTP_OFF = "off"
+CLIP_MTP_MODES = (CLIP_MTP_AUTO, CLIP_MTP_OFF)
+
 # Continue mode keeps the whole conversation in the answer widget, written as an
 # IRC-style log. A native textarea is the only editor this node has, so the log
 # has to be plain text the user can read, edit and delete lines from — and the
@@ -250,6 +260,7 @@ CONFIG_DEFAULTS = {
     "gguf_describe_media": False,
     "clip_model": "",
     "clip_unload_after": False,
+    "clip_mtp": CLIP_MTP_AUTO,
     # Extra Host names the routes answer to, for a reverse proxy on this machine.
     # Hand-edited only: the settings route never writes it.
     "allowed_hosts": [],
@@ -316,6 +327,9 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
     if thinking not in THINKING_MODES:
         thinking = THINKING_OFF
     mmproj = str(source.get("gguf_mmproj") or GGUF_MMPROJ_AUTO).strip() or GGUF_MMPROJ_AUTO
+    clip_mtp = str(source.get("clip_mtp") or CLIP_MTP_AUTO).strip().lower()
+    if clip_mtp not in CLIP_MTP_MODES:
+        clip_mtp = CLIP_MTP_AUTO
     video_sample = str(source.get("video_sample") or "").strip().lower()
     if video_sample not in VIDEO_SAMPLES:
         video_sample = VIDEO_SAMPLE_DEFAULT
@@ -350,6 +364,7 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
         "gguf_describe_media": _as_bool(source.get("gguf_describe_media"), False),
         "clip_model": str(source.get("clip_model") or "").strip(),
         "clip_unload_after": _as_bool(source.get("clip_unload_after"), False),
+        "clip_mtp": clip_mtp,
         "allowed_hosts": [
             str(host).strip().lower() for host in (hosts if isinstance(hosts, (list, tuple)) else [])
             if str(host).strip()
@@ -2910,6 +2925,23 @@ def _clip_tokens(
     return clip.tokenize("\n\n".join(blocks), image=batch, skip_template=False, min_length=1, thinking=not no_think)
 
 
+def _clip_generate_options(clip, settings: Mapping[str, Any]) -> dict[str, Any]:
+    """The MTP argument for `clip.generate`, only when it has to be said.
+
+    comfy's default is `mtp=True`, which is `auto`, so nothing is passed for it
+    — and nothing at all on a ComfyUI from before the argument existed (v0.45),
+    where naming it would be a TypeError on every run.
+    """
+    if str(settings.get("clip_mtp") or CLIP_MTP_AUTO).lower() != CLIP_MTP_OFF:
+        return {}
+    try:
+        if "mtp" not in inspect.signature(clip.generate).parameters:
+            return {}
+    except (TypeError, ValueError):
+        return {}
+    return {"mtp": False}
+
+
 def _clip_workflow_running() -> bool:
     try:
         from server import PromptServer
@@ -2982,6 +3014,7 @@ def _clip_generate(
     max_tokens = int(settings.get("max_length") or MAX_LENGTH_DEFAULT)
     temperature = float(settings.get("temperature", CONFIG_DEFAULTS["temperature"]))
     no_think = str(settings.get("thinking") or THINKING_OFF).lower() != THINKING_KEEP
+    mtp_mode = str(settings.get("clip_mtp") or CLIP_MTP_AUTO).lower()
     _clip_set_active("" if executing else request_id)
     try:
         # The executor runs nodes under inference_mode, and a model loaded under
@@ -2993,9 +3026,9 @@ def _clip_generate(
             ])
             _log(
                 "asking text encoder %s (system=%d chars, question=%d chars, images=%d, history=%d turns, "
-                "max_tokens=%d, thinking=%s)",
+                "max_tokens=%d, thinking=%s, mtp=%s)",
                 str(settings.get("clip_model") or ""), len(system_prompt), len(user_prompt), len(images),
-                len(history or []), max_tokens, "off" if no_think else "kept",
+                len(history or []), max_tokens, "off" if no_think else "kept", mtp_mode,
             )
             tokens = _clip_tokens(clip, system_prompt, user_prompt, images, no_think, history)
             try:
@@ -3003,7 +3036,7 @@ def _clip_generate(
                     ids = clip.generate(
                         tokens, do_sample=temperature > 0.0, max_length=max_tokens,
                         temperature=max(temperature, 0.01), top_k=64, top_p=0.95, min_p=0.05,
-                        repetition_penalty=1.05, seed=0,
+                        repetition_penalty=1.05, seed=0, **_clip_generate_options(clip, settings),
                     )
             finally:
                 _clip_after_generate()
@@ -3035,7 +3068,11 @@ def _clip_generate(
         )
     if not text:
         raise ValueError("The text encoder returned an empty answer")
-    _log("finished in %.1fs (%d tokens, %d chars)", time.perf_counter() - started, len(ids), len(text))
+    elapsed = time.perf_counter() - started
+    _log(
+        "finished in %.1fs (%d tokens, %.1f tokens/s, %d chars)",
+        elapsed, len(ids), len(ids) / elapsed if elapsed > 0 else 0.0, len(text),
+    )
     return text
 
 

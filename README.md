@@ -170,6 +170,7 @@ Reroute ノードは辿って追跡します。
 | Context size | gguf | `n_ctx` |
 | GPU layers | gguf | `n_gpu_layers`。`-1` で全レイヤーをオフロード |
 | Text encoder | clip | `models/text_encoders` の `.safetensors` — *ComfyUI のテキストエンコーダを LLM として使う* を参照 |
+| Speculative decoding (MTP) | clip | `Auto`（既定）または `Off`。MTP ヘッド付きのエンコーダで ComfyUI 0.45 以降が行う投機的デコードを止めます |
 | Model thinking | 全て | `Off`（既定）または `Keep` — *推論（thinking）* を参照 |
 | Temperature | 全て | |
 | Max answer tokens | 全て | ローカルバックエンドでは `max_tokens`。答えの長さの上限 |
@@ -232,6 +233,11 @@ Qwen-Image 2.1 のテキストエンコーダは Qwen3-VL-8B そのものなの�
 - ワークフロー側の CLIP Loader とは別に読み込みます。VRAM が足りなくなれば ComfyUI が通常どおり
   退避させますが、すぐ空けたいときは ⏏ か `Unload after answering` を使ってください。
 - 画像は長辺 1024px に縮めてから渡します（1 枚あたりおよそ 1000 トークン）。
+- **Speculative decoding (MTP)**: Qwen3.5 系の一部のエンコーダは multi-token-prediction ヘッド
+  （`mtp.fc.weight`）を持ち、ComfyUI 0.45 以降はそれを使って 1 ステップで複数トークンを下書きします
+  （本体の `Generate Text` ノードの `auto` と同じ）。分布は変わりませんが、同じ seed でも MTP
+  なしとは別の文章になります。従来どおりの出力がほしいときや MTP 経路で不具合が出たときは `Off`
+  にしてください。ヘッドの無いエンコーダや古い ComfyUI では何も変わりません。
 - ■ で停止できます。ComfyUI 自身の Cancel と同じ割り込みフラグを使うので、次のカーネルで
   止まります（ワークフローの実行中はフラグが共有のため立てません）。停止するとエンコーダは
   解放されます。
@@ -622,6 +628,7 @@ API key** and is gitignored.
 | Context size | gguf | `n_ctx` |
 | GPU layers | gguf | `n_gpu_layers`, `-1` offloads everything |
 | Text encoder | clip | A `.safetensors` under `models/text_encoders` — see *Using a ComfyUI text encoder as the LLM* |
+| Speculative decoding (MTP) | clip | `Auto` (default) or `Off`. Turns off the speculative decoding ComfyUI 0.45+ does through an encoder's MTP head |
 | Model thinking | all | `Off` (default) or `Keep` — see *Reasoning* |
 | Temperature | all | |
 | Max answer tokens | all | `max_tokens` for the local backends, the answer length cap |
@@ -686,6 +693,11 @@ conversation history and several images all work.
 - It is loaded separately from the workflow's CLIP Loader. ComfyUI offloads it as usual when VRAM
   runs short; use ⏏ or `Unload after answering` to get the memory back right away.
 - Images are shrunk to 1024px on the long side first (about a thousand tokens each).
+- **Speculative decoding (MTP)**: some Qwen3.5-family encoders ship a multi-token-prediction head
+  (`mtp.fc.weight`), and ComfyUI 0.45+ uses it to draft several tokens per step — the same as the
+  `Generate Text` node's `auto`. The distribution is unchanged, but the text differs from non-MTP
+  decoding for the same seed. Set it to `Off` for the old output or when the MTP path misbehaves;
+  it changes nothing for an encoder without the head or on an older ComfyUI.
 - ■ stops it the way ComfyUI's own Cancel button would, through the interrupt flag every kernel
   checks — only while no workflow is running, since the flag is global. Stopping releases the
   encoder.

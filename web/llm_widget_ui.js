@@ -52,6 +52,16 @@ const THINKING_LABELS = {
     [THINKING_KEEP]: "Keep — show the reasoning in the answer",
 };
 
+// Speculative decoding through a text encoder's multi-token-prediction head.
+// `auto` is ComfyUI's own default; `off` is the escape hatch (see nodes.py).
+const CLIP_MTP_AUTO = "auto";
+const CLIP_MTP_OFF = "off";
+const CLIP_MTP_MODES = [CLIP_MTP_AUTO, CLIP_MTP_OFF];
+const CLIP_MTP_LABELS = {
+    [CLIP_MTP_AUTO]: "Auto — use the MTP head when the encoder has one",
+    [CLIP_MTP_OFF]: "Off — plain token-by-token decoding",
+};
+
 // Continue mode turns the answer field into an IRC-style log. The markers are
 // the server's, and only a line that starts with one opens a turn.
 const CHAT_USER_MARK = "<you>";
@@ -143,6 +153,7 @@ const SETTINGS_DEFAULTS = Object.freeze({
     gguf_describe_media: false,
     clip_model: "",
     clip_unload_after: false,
+    clip_mtp: CLIP_MTP_AUTO,
     // Read-only, from the server: the key itself is never sent to the editor.
     api_key_set: false,
     // Read-only, from the server: the origins an HTTP backend may be sent to.
@@ -188,6 +199,12 @@ const TEXT = {
     ggufUnload: "Unload the model after answering",
     ggufDescribe: "Describe each media in its own pass",
     clipModel: "Text encoder",
+    clipMtp: "Speculative decoding (MTP)",
+    clipMtpHint:
+        "Qwen3.5-family encoders shipped with a multi-token-prediction head draft several tokens per step; "
+        + "ComfyUI 0.45+ uses it automatically. The output stays correctly distributed but differs from the "
+        + "plain decoding for the same seed. Off restores plain decoding; it changes nothing for an encoder "
+        + "without the head or on an older ComfyUI.",
     readMedia: "Send the connected image / video",
     videoSample: "Video frames sent",
     videoSampleHint:
@@ -306,6 +323,9 @@ function normalizeSettings(value) {
         gguf_describe_media: asBoolean(source.gguf_describe_media, false),
         clip_model: String(source.clip_model || "").trim(),
         clip_unload_after: asBoolean(source.clip_unload_after, false),
+        clip_mtp: CLIP_MTP_MODES.includes(String(source.clip_mtp || "").toLowerCase())
+            ? String(source.clip_mtp).toLowerCase()
+            : CLIP_MTP_AUTO,
         api_key_set: asBoolean(source.api_key_set, false),
         allowed_api_urls: Array.isArray(source.allowed_api_urls)
             ? source.allowed_api_urls.map((item) => String(item || "").trim()).filter(Boolean)
@@ -826,6 +846,11 @@ async function openSettings() {
         { value: settingsCache.clip_model, label: settingsCache.clip_model || TEXT.clipEmpty },
     ]);
     const clipUnload = makeSwitch(settingsCache.clip_unload_after);
+    const clipMtp = makeSelect(
+        settingsCache.clip_mtp,
+        null,
+        CLIP_MTP_MODES.map((value) => ({ value, label: CLIP_MTP_LABELS[value] })),
+    );
 
     const hint = document.createElement("p");
     hint.className = "llmw-hint";
@@ -868,6 +893,10 @@ async function openSettings() {
     const ggufDescribeRow = makeCheckRow(TEXT.ggufDescribe, ggufDescribe);
     const clipModelRow = makeRow(TEXT.clipModel, clipModel);
     const clipUnloadRow = makeCheckRow(TEXT.ggufUnload, clipUnload);
+    const clipMtpRow = makeRow(TEXT.clipMtp, clipMtp);
+    const clipMtpHint = document.createElement("p");
+    clipMtpHint.className = "llmw-hint";
+    clipMtpHint.textContent = TEXT.clipMtpHint;
 
     form.append(
         makeRow(TEXT.apiFormat, apiFormat),
@@ -883,6 +912,8 @@ async function openSettings() {
         ggufContextRow,
         ggufGpuLayersRow,
         clipModelRow,
+        clipMtpRow,
+        clipMtpHint,
         thinkingRow,
         thinkingHint,
         temperatureRow,
@@ -953,7 +984,7 @@ async function openSettings() {
             row.hidden = gguf || clip;
         }
         for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadRow]) row.hidden = !gguf;
-        for (const row of [clipModelRow, clipUnloadRow]) row.hidden = !clip;
+        for (const row of [clipModelRow, clipMtpRow, clipMtpHint, clipUnloadRow]) row.hidden = !clip;
         // Describing media one at a time only means something once media is sent.
         ggufDescribeRow.hidden = !gguf || !readMedia.checked;
         // So does how many frames a video is thinned to.
@@ -1012,6 +1043,7 @@ async function openSettings() {
         gguf_describe_media: ggufDescribe.checked,
         clip_model: clipModel.value,
         clip_unload_after: clipUnload.checked,
+        clip_mtp: clipMtp.value,
     });
     // Compared through normalizeSettings so the number inputs' string values and
     // a clamped-away edit do not count as a change.
@@ -1039,7 +1071,7 @@ async function openSettings() {
     settingsModal = { dialog, close };
     document.addEventListener("keydown", onKeyDown, true);
     overlay.addEventListener("pointerdown", (event) => {
-        for (const select of [apiFormat, thinking, ggufModel, ggufMmproj, clipModel, videoSample]) {
+        for (const select of [apiFormat, thinking, ggufModel, ggufMmproj, clipModel, clipMtp, videoSample]) {
             if (!select.contains?.(event.target)) select.closeMenu?.();
         }
         if (event.target === overlay) requestClose();
