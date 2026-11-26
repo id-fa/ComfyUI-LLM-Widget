@@ -77,11 +77,16 @@ REMOTE_UNLOAD_FORMATS = (FORMAT_OPENAI, FORMAT_RESPONSES)
 
 # Ask the model not to reason, and drop any block it emits anyway.
 THINKING_OFF = "off"
+# Let the model reason, but keep the thought out of the answer: no switch is
+# sent, the tagged block is cut off the front of the reply and handed to the
+# node's `thinking` output under generate_on_execute. A thought that carries no
+# marker stays in the answer, exactly as it would under Keep.
+THINKING_HIDE = "hide"
 # Leave the request alone and show whatever the model returns, reasoning
 # included. For a model whose reasoning is not tagged, this is the honest
 # setting: nothing downstream can tell where the thinking stopped.
 THINKING_KEEP = "keep"
-THINKING_MODES = (THINKING_OFF, THINKING_KEEP)
+THINKING_MODES = (THINKING_OFF, THINKING_HIDE, THINKING_KEEP)
 
 # Speculative decoding through the text encoder's multi-token-prediction head.
 # `auto` is comfy's default (`CLIP.generate(mtp=True)`, the Generate Text node's
@@ -786,6 +791,16 @@ _THOUGHT_CHANNEL_RE = re.compile(
     flags=re.I | re.S,
 )
 _OPEN_CHANNEL_RE = re.compile(rf"\A\s*{_CHANNEL_MARK}\s*(?:{_THINK_TAGS})\b", flags=re.I)
+# What is left of a reasoning block once the markers that delimited it are
+# removed: Harmony's `<|channel|>analysis<|message|>` … `<|end|><|start|>assistant`,
+# Gemma's `<|channel>thought` … `<channel|>`, and the plain `<think>` … `</think>`.
+_THOUGHT_NOISE_RE = re.compile(
+    rf"{_CHANNEL_MARK}\s*(?:{_THINK_TAGS}|final)\b\s*(?:{_MESSAGE_MARK})?"
+    rf"|{_CHANNEL_MARK}|{_MESSAGE_MARK}"
+    rf"|</?(?:{_THINK_TAGS})>"
+    rf"|<\|(?:start|end|return|endoftext|im_start|im_end)\|>[ \t]*(?:assistant\b)?",
+    flags=re.I,
+)
 _TRAILING_TOKEN_RE = re.compile(r"<\|(?:return|end|endoftext|im_end)\|>\s*\Z", flags=re.I)
 _WHOLE_FENCE_RE = re.compile(r"\A```([A-Za-z0-9_+.-]*)[ \t]*\r?\n(.*?)\r?\n?```\Z", flags=re.S)
 # Fences that only wrap prose are unwrapped; a ```python block is the answer
@@ -809,27 +824,61 @@ def _opens_with_thinking(text: Any) -> bool:
     return bool(_OPEN_THINK_RE.match(value) or _OPEN_CHANNEL_RE.match(value))
 
 
-def _clean_output(text: Any, strip_thinking: bool = True) -> str:
-    """Reduce a model's answer to the answer itself.
+def _split_thinking(value: str) -> tuple[str, str]:
+    """Cut the tagged reasoning off the front of a reply: `(reasoning, rest)`, both raw.
+
+    The same three cuts in the same order as the cleanup always made, each
+    greedy to the *last* marker of its kind: a Harmony `final` channel, a
+    thinking channel closed by a bare marker, a closing `</think>`. Nothing is
+    cut when no marker is there, so untagged reasoning stays where it was.
+    """
+    removed: list[str] = []
+    for pattern in (_FINAL_CHANNEL_RE, _THOUGHT_CHANNEL_RE):
+        match = pattern.match(value)
+        if match:
+            removed.append(match.group(0))
+            value = value[match.end():].strip()
+    value = _TRAILING_TOKEN_RE.sub("", value).strip()
+    match = _THINK_CLOSE_RE.match(value)
+    if match:
+        removed.append(match.group(0))
+        value = value[match.end():].strip()
+    return "\n".join(removed), value
+
+
+def _thought_text(raw: str) -> str:
+    """A reasoning block as readable text: the markers that delimited it removed."""
+    return _THOUGHT_NOISE_RE.sub("", str(raw or "")).strip()
+
+
+def _join_thoughts(*pieces: Any) -> str:
+    """Reasoning gathered from more than one place (a reply field and a tagged block)."""
+    return "\n\n".join(str(piece).strip() for piece in pieces if str(piece or "").strip())
+
+
+def _split_output(text: Any, strip_thinking: bool = True) -> tuple[str, str]:
+    """Reduce a model's reply to `(answer, reasoning)`.
 
     Reasoning models emit a thinking block before the answer and it must never
     reach the widget. Thinking is switched off per backend where that is
     possible; this is the backstop for models that ignore it, or whose template
-    opens the block for them so only its closing tag is ever emitted.
+    opens the block for them so only its closing tag is ever emitted — and,
+    under **Model thinking = Hide**, the one thing that separates the two. The
+    reasoning comes back as plain text for the node's `thinking` output; it is
+    "" when nothing was stripped.
 
     Untagged reasoning cannot be removed here — nothing marks where it ends —
     so the switches in the request are what actually has to work.
     """
     value = str(text or "").strip()
+    thought = ""
     if strip_thinking:
-        value = _FINAL_CHANNEL_RE.sub("", value).strip()
-        value = _THOUGHT_CHANNEL_RE.sub("", value).strip()
-        value = _TRAILING_TOKEN_RE.sub("", value).strip()
-        value = _THINK_CLOSE_RE.sub("", value).strip()
+        thought, value = _split_thinking(value)
         if _opens_with_thinking(value):
             # An unterminated block means the answer was cut off mid-thought,
-            # so there is no answer in here at all.
-            return ""
+            # so there is no answer in here at all: the whole reply is thought.
+            return "", _thought_text(_join_thoughts(thought, value))
+        thought = _thought_text(thought)
     match = _WHOLE_FENCE_RE.match(value)
     if (
         match
@@ -837,7 +886,43 @@ def _clean_output(text: Any, strip_thinking: bool = True) -> str:
         and not _INNER_FENCE_RE.search(match.group(2))
     ):
         value = match.group(2)
-    return value.strip()
+    return value.strip(), thought
+
+
+def _clean_output(text: Any, strip_thinking: bool = True) -> str:
+    """The answer alone; see `_split_output`."""
+    return _split_output(text, strip_thinking)[0]
+
+
+def _thinking_mode(settings: Mapping[str, Any]) -> str:
+    """The `thinking` setting folded to one of THINKING_MODES."""
+    mode = str(settings.get("thinking") or THINKING_OFF).strip().lower()
+    return mode if mode in THINKING_MODES else THINKING_OFF
+
+
+def _thinking_overflow_message(max_tokens: int | None, thinking: str) -> str:
+    """The error for a reply that is one unterminated reasoning block.
+
+    Distinguishable from "the model said nothing": the block is there, it simply
+    never closed. Naming it is the difference between a setting the user can
+    change and an unexplained empty answer — and which setting depends on the
+    mode: under Hide the switch was deliberately not sent. `max_tokens` is the
+    local backends' budget; the HTTP formats pass None, since the limit that
+    was hit there is the endpoint's.
+    """
+    remedy = (
+        "set Model thinking to Off" if thinking == THINKING_HIDE
+        else "use a model whose thinking can be switched off"
+    )
+    if max_tokens is None:
+        return (
+            "The model ran out of output tokens while reasoning and never reached an answer. "
+            f"Raise the endpoint's output limit, or {remedy}."
+        )
+    return (
+        f"The model spent all {int(max_tokens)} tokens reasoning and never reached an answer. "
+        f"Raise Max answer tokens, or {remedy}."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1450,6 +1535,29 @@ def _thinking_off_payload(api_format: str) -> dict[str, Any]:
     return {"chat_template_kwargs": {"enable_thinking": False, "reasoning_effort": REASONING_EFFORT}}
 
 
+def _thinking_payload(api_format: str, thinking: str) -> dict[str, Any]:
+    """The extra request fields for a `thinking` mode; `{}` means none.
+
+    **Off** is `_thinking_off_payload`. **Hide** sends no switch — the model is
+    meant to reason — but asks the two cloud shapes that keep the thought out
+    of the text to return it alongside, so the `thinking` output has something
+    to carry: Gemini's `includeThoughts` (thought parts, flagged `thought`),
+    the Responses API's `reasoning.summary` (the `summary` of its `reasoning`
+    items). Both are optional fields and go through the same retry-without-them
+    path as the Off switches, since a model without reasoning rejects them.
+    Chat completions has no such field; a server that separates the thought
+    does so on its own (`reasoning_content`). **Keep** sends nothing.
+    """
+    if thinking == THINKING_OFF:
+        return _thinking_off_payload(api_format)
+    if thinking == THINKING_HIDE:
+        if api_format == FORMAT_GEMINI:
+            return {"generationConfig": {"thinkingConfig": {"includeThoughts": True}}}
+        if api_format == FORMAT_RESPONSES:
+            return {"reasoning": {"summary": "auto"}}
+    return {}
+
+
 def _merge_payload(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
     merged = dict(base)
     for key, value in extra.items():
@@ -1616,7 +1724,7 @@ def _http_post(
                     + (" and rejected them even after they were re-encoded as JPEG" if transcoded else "")
                 ) from exc
             if index < len(attempts) and exc.code in {400, 404, 422}:
-                _log("the endpoint rejected the thinking-off fields (%d); retrying without them", exc.code)
+                _log("the endpoint rejected the optional thinking fields (%d); retrying without them", exc.code)
                 continue
             raise last from exc
         except urllib.error.URLError as exc:
@@ -1637,6 +1745,41 @@ def _is_reasoning_type(value: Any) -> bool:
     spellings some servers use.
     """
     return isinstance(value, str) and value.lower().startswith("reasoning")
+
+
+def _responses_reasoning(data: Any) -> str:
+    """The reasoning of a Responses API reply, as text.
+
+    The mirror image of `_responses_text`: the `summary[]` (OpenAI, only when
+    `reasoning.summary` was asked for) and `content[]` (local servers,
+    `reasoning_text` parts) of `reasoning` items, plus `reasoning_text` parts a
+    server put inside a message item. "" when there is none.
+    """
+    if not isinstance(data, Mapping) or not isinstance(data.get("output"), list):
+        return ""
+    chunks: list[str] = []
+
+    def take(part: Any) -> None:
+        if not isinstance(part, Mapping):
+            return
+        value = part.get("text")
+        if isinstance(value, str) and value.strip():
+            chunks.append(value.strip())
+        elif isinstance(value, Mapping) and isinstance(value.get("value"), str) and value["value"].strip():
+            chunks.append(value["value"].strip())
+
+    for item in data["output"]:
+        if not isinstance(item, Mapping):
+            continue
+        reasoning_item = _is_reasoning_type(item.get("type"))
+        for key in ("summary", "content"):
+            parts = item.get(key)
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if reasoning_item or (isinstance(part, Mapping) and _is_reasoning_type(part.get("type"))):
+                    take(part)
+    return "\n\n".join(chunks)
 
 
 def _responses_text(data: Any) -> str:
@@ -1858,21 +2001,22 @@ def _http_generate(
     user_prompt: str,
     media_parts: Sequence[Mapping[str, Any]] | None = None,
     history: Sequence[Mapping[str, str]] | None = None,
-) -> str:
+) -> tuple[str, str]:
+    """Ask the configured HTTP endpoint; `(answer, reasoning)`."""
     api_format = str(settings.get("api_format") or FORMAT_OPENAI)
     api_url = str(settings.get("api_url") or "")
     api_key = str(settings.get("api_key") or "")
     model = str(settings.get("model") or "")
     temperature = float(settings.get("temperature", CONFIG_DEFAULTS["temperature"]))
-    no_think = str(settings.get("thinking") or THINKING_OFF).lower() != THINKING_KEEP
+    thinking = _thinking_mode(settings)
+    strip = thinking != THINKING_KEEP
     url = _normalize_url(api_url, api_format, model)
     media_parts = list(media_parts or [])
     history = list(history or [])
     started = time.perf_counter()
     _log(
         "asking %s (model=%s, system=%d chars, question=%d chars, media parts=%d, history=%d turns, thinking=%s)",
-        api_format, model or "?", len(system_prompt), len(user_prompt), len(media_parts), len(history),
-        "off" if no_think else "kept",
+        api_format, model or "?", len(system_prompt), len(user_prompt), len(media_parts), len(history), thinking,
     )
     if api_format == FORMAT_GEMINI:
         headers = {"Content-Type": "application/json", "Accept": "application/json", "x-goog-api-key": api_key}
@@ -1941,9 +2085,11 @@ def _http_generate(
             "temperature": temperature,
             "max_tokens": HTTP_MAX_OUTPUT_TOKENS,
         }
-    data = _http_post(
-        url, headers, payload, _thinking_off_payload(api_format) if no_think else {}, timeout=_http_timeout(settings),
-    )
+    data = _http_post(url, headers, payload, _thinking_payload(api_format, thinking), timeout=_http_timeout(settings))
+    # Reasoning a reply carries *apart from* the text. It was never in the
+    # answer, so it goes to the `thinking` output whatever the mode; what the
+    # mode decides is whether a block tagged inside the text is cut out too.
+    aside = ""
     if api_format == FORMAT_GEMINI:
         candidates = data.get("candidates") if isinstance(data, dict) else None
         if not isinstance(candidates, list) or not candidates:
@@ -1952,12 +2098,20 @@ def _http_generate(
             raise RuntimeError("Gemini API returned no candidates" + (f": {reason}" if reason else ""))
         candidate = candidates[0] if isinstance(candidates[0], dict) else {}
         parts = candidate.get("content", {}).get("parts", []) if isinstance(candidate.get("content"), dict) else []
-        text = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict) and part.get("text") is not None)
+        parts = [part for part in parts if isinstance(part, dict) and part.get("text") is not None]
+        # `includeThoughts` flags its thought parts; under Keep they stay in
+        # the answer, which is what Keep means.
+        def is_thought(part: Mapping[str, Any]) -> bool:
+            return strip and bool(part.get("thought"))
+
+        aside = "\n\n".join(str(part.get("text", "")).strip() for part in parts if is_thought(part))
+        text = "".join(str(part.get("text", "")) for part in parts if not is_thought(part))
         if not text.strip():
             finish = candidate.get("finishReason") or candidate.get("finish_reason") or "unknown"
             raise RuntimeError(f"Gemini API returned no text (finish reason: {finish})")
     elif api_format == FORMAT_RESPONSES:
         text = _responses_text(data)
+        aside = _responses_reasoning(data)
         if not text.strip() and isinstance(data, dict):
             # A reply cut short says why in `incomplete_details`; "empty" alone
             # would hide that the budget ran out.
@@ -1971,11 +2125,24 @@ def _http_generate(
         text = content if isinstance(content, str) else "".join(
             str(item.get("text", "")) for item in (content or []) if isinstance(item, dict)
         )
-    text = _clean_output(text, no_think)
+        # llama.cpp server, vLLM, LM Studio and Ollama put a separated thought
+        # here (two spellings) when they are configured to parse it out.
+        for key in ("reasoning_content", "reasoning"):
+            if isinstance(message.get(key), str) and message[key].strip():
+                aside = message[key]
+                break
+    raw = text
+    text, thought = _split_output(raw, strip)
+    thought = _join_thoughts(aside, thought)
     if not text:
+        if strip and _opens_with_thinking(raw):
+            raise RuntimeError(_thinking_overflow_message(None, thinking))
         raise RuntimeError("The API returned an empty response")
-    _log("finished in %.1fs (%d chars)", time.perf_counter() - started, len(text))
-    return text
+    _log(
+        "finished in %.1fs (%d chars%s)", time.perf_counter() - started, len(text),
+        f", {len(thought)} chars of reasoning set aside" if thought else "",
+    )
+    return text, thought
 
 
 # --------------------------------------------------------------------------- #
@@ -2478,13 +2645,19 @@ def _gguf_chat(
     temperature: float,
     gemma: bool,
     should_stop=None,
-    no_think: bool = True,
+    thinking: str = THINKING_OFF,
     history: Sequence[Mapping[str, str]] | None = None,
-) -> str:
-    """One llama-cpp turn with reasoning off and cancellation wired in."""
+) -> tuple[str, str]:
+    """One llama-cpp turn with cancellation wired in; `(answer, reasoning)`.
+
+    `thinking` is the mode: **Off** sends the switches and strips, **Hide**
+    strips only, **Keep** does neither.
+    """
+    switch_off = thinking == THINKING_OFF
+    strip = thinking != THINKING_KEEP
     # Qwen switches reasoning off with an inline token; Gemma has no equivalent
     # and relies on the handler flag plus the output cleanup.
-    text = user_text if gemma or not no_think else f"/no_think\n{user_text}"
+    text = f"/no_think\n{user_text}" if switch_off and not gemma else user_text
     stop = ["<|turn>", "<|channel>", "<end_of_turn>", "<start_of_turn>"] if gemma else ["<|im_end|>", "<|im_start|>"]
     content: Any = [{"type": "text", "text": text}, *parts] if parts else text
     messages: list[dict[str, Any]] = []
@@ -2502,25 +2675,22 @@ def _gguf_chat(
         "seed": 0,
         "stop": stop,
     }
-    if no_think:
+    if switch_off:
         # Newer Qwen templates dropped the `/no_think` token for a template
         # variable. Only some builds take it as an argument; where they do not,
         # `_gguf_call` drops it and the same values are set inside the template
         # instead (`GGUF_TEMPLATE_PREFIX`). Its presence is also how `_gguf_call`
-        # tells an Off turn from a Keep turn.
+        # tells an Off turn from a Hide or Keep turn, which both run the model's
+        # own default.
         request["chat_template_kwargs"] = {"enable_thinking": False, "reasoning_effort": REASONING_EFFORT}
 
-    def finish(raw: Any) -> str:
-        text = _clean_output(raw, no_think)
-        if not text and no_think and _opens_with_thinking(raw):
+    def finish(raw: Any) -> tuple[str, str]:
+        text, thought = _split_output(raw, strip)
+        if not text and strip and _opens_with_thinking(raw):
             # Distinguishable from "the model said nothing": the block is there,
-            # it simply never closed. Naming it is the difference between a
-            # setting the user can raise and an unexplained empty answer.
-            raise _ThinkingOverflow(
-                f"The model spent all {int(max_tokens)} tokens reasoning and never reached an answer. "
-                "Raise Max answer tokens, or use a model whose thinking can be switched off."
-            )
-        return text
+            # it simply never closed.
+            raise _ThinkingOverflow(_thinking_overflow_message(max_tokens, thinking))
+        return text, thought
 
     if should_stop is not None:
         return finish(_gguf_stream(llm, request, should_stop))
@@ -2597,7 +2767,9 @@ def _gguf_describe(
             )
             step = time.perf_counter()
             try:
-                description = _gguf_chat(llm, DESCRIBE_SYSTEM, request, parts, budget, temperature, gemma, should_stop)
+                description, _ = _gguf_chat(
+                    llm, DESCRIBE_SYSTEM, request, parts, budget, temperature, gemma, should_stop,
+                )
             except _Cancelled:
                 raise
             except _ThinkingOverflow as exc:
@@ -2611,7 +2783,7 @@ def _gguf_describe(
                     label, index, len(describable), budget,
                 )
                 try:
-                    description = _gguf_chat(
+                    description, _ = _gguf_chat(
                         llm, DESCRIBE_SYSTEM, request, parts, budget, temperature, gemma, should_stop,
                     )
                 except _Cancelled:
@@ -2643,8 +2815,8 @@ def _gguf_generate(
     context: str = "",
     keep_vision: bool = False,
     history: Sequence[Mapping[str, str]] | None = None,
-) -> str:
-    """Run the question through a local GGUF and return the answer."""
+) -> tuple[str, str]:
+    """Run the question through a local GGUF; `(answer, reasoning)`."""
     images = [part for part in (media_parts or []) if part.get("type") == "image_url"]
     started = time.perf_counter()
     # keep_vision holds the projector in the signature after a describe pass, so
@@ -2665,11 +2837,11 @@ def _gguf_generate(
     )
     max_tokens = int(settings.get("max_length") or MAX_LENGTH_DEFAULT)
     temperature = float(settings.get("temperature", CONFIG_DEFAULTS["temperature"]))
-    no_think = str(settings.get("thinking") or THINKING_OFF).lower() != THINKING_KEEP
-    _log("generating (max_tokens=%d, images=%d, thinking=%s)...", max_tokens, len(images), "off" if no_think else "kept")
+    thinking = _thinking_mode(settings)
+    _log("generating (max_tokens=%d, images=%d, thinking=%s)...", max_tokens, len(images), thinking)
     try:
-        text = _gguf_chat(
-            llm, system_prompt, user_text, images, max_tokens, temperature, gemma, should_stop, no_think, history,
+        text, thought = _gguf_chat(
+            llm, system_prompt, user_text, images, max_tokens, temperature, gemma, should_stop, thinking, history,
         )
     except _Cancelled:
         # Stopping hands the VRAM back. Keeping a model resident for a
@@ -2681,8 +2853,11 @@ def _gguf_generate(
             _gguf_release()
     if not text:
         raise ValueError("The GGUF model returned an empty answer")
-    _log("finished in %.1fs (%d chars)", time.perf_counter() - started, len(text))
-    return text
+    _log(
+        "finished in %.1fs (%d chars%s)", time.perf_counter() - started, len(text),
+        f", {len(thought)} chars of reasoning set aside" if thought else "",
+    )
+    return text, thought
 
 
 # --------------------------------------------------------------------------- #
@@ -2887,10 +3062,15 @@ def _clip_tokens(
     system_prompt: str,
     user_text: str,
     images: Sequence[Any],
-    no_think: bool,
+    switch_off: bool,
     history: Sequence[Mapping[str, str]] | None,
 ):
-    """Tokenize one turn, as a full chat where the tokenizer allows one."""
+    """Tokenize one turn, as a full chat where the tokenizer allows one.
+
+    `switch_off` closes the thought block in the assistant prefix (**Off**);
+    otherwise the model decides, and a block it writes is split off afterwards
+    under **Hide**.
+    """
     name = str(getattr(clip.tokenizer, "clip_name", "") or "")
     family = next((key for key in _CLIP_CHATML_FAMILIES if name.startswith(key)), "")
     if family:
@@ -2902,7 +3082,7 @@ def _clip_tokens(
             f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n" for message in (history or [])
         )
         turns.append(f"<|im_start|>user\n{_CLIP_VISION_BLOCK * len(images)}{user_text}<|im_end|>\n")
-        turns.append("<|im_start|>assistant\n" + (_CLIP_CHATML_FAMILIES[family] if no_think else ""))
+        turns.append("<|im_start|>assistant\n" + (_CLIP_CHATML_FAMILIES[family] if switch_off else ""))
         return clip.tokenize("".join(turns), images=list(images), min_length=1)
 
     # Any other family only has comfy's own single-turn template, so the system
@@ -2926,7 +3106,7 @@ def _clip_tokens(
             else comfy.utils.common_upscale(image.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
             for image in images
         ], dim=0)
-    return clip.tokenize("\n\n".join(blocks), image=batch, skip_template=False, min_length=1, thinking=not no_think)
+    return clip.tokenize("\n\n".join(blocks), image=batch, skip_template=False, min_length=1, thinking=not switch_off)
 
 
 def _clip_generate_options(clip, settings: Mapping[str, Any]) -> dict[str, Any]:
@@ -2998,8 +3178,8 @@ def _clip_generate(
     history: Sequence[Mapping[str, str]] | None = None,
     executing: bool = False,
     request_id: str = "",
-) -> str:
-    """Run the question through a ComfyUI text encoder and return the answer."""
+) -> tuple[str, str]:
+    """Run the question through a ComfyUI text encoder; `(answer, reasoning)`."""
     import comfy.model_management
     import torch
 
@@ -3017,7 +3197,8 @@ def _clip_generate(
     started = time.perf_counter()
     max_tokens = int(settings.get("max_length") or MAX_LENGTH_DEFAULT)
     temperature = float(settings.get("temperature", CONFIG_DEFAULTS["temperature"]))
-    no_think = str(settings.get("thinking") or THINKING_OFF).lower() != THINKING_KEEP
+    thinking = _thinking_mode(settings)
+    strip = thinking != THINKING_KEEP
     mtp_mode = str(settings.get("clip_mtp") or CLIP_MTP_AUTO).lower()
     _clip_set_active("" if executing else request_id)
     try:
@@ -3032,9 +3213,9 @@ def _clip_generate(
                 "asking text encoder %s (system=%d chars, question=%d chars, images=%d, history=%d turns, "
                 "max_tokens=%d, thinking=%s, mtp=%s)",
                 str(settings.get("clip_model") or ""), len(system_prompt), len(user_prompt), len(images),
-                len(history or []), max_tokens, "off" if no_think else "kept", mtp_mode,
+                len(history or []), max_tokens, thinking, mtp_mode,
             )
-            tokens = _clip_tokens(clip, system_prompt, user_prompt, images, no_think, history)
+            tokens = _clip_tokens(clip, system_prompt, user_prompt, images, thinking == THINKING_OFF, history)
             try:
                 with _clip_cancel_hook(should_stop):
                     ids = clip.generate(
@@ -3064,20 +3245,18 @@ def _clip_generate(
         _clip_set_active("")
         if _as_bool(settings.get("clip_unload_after")):
             _clip_release()
-    text = _clean_output(raw, no_think)
-    if not text and no_think and _opens_with_thinking(raw):
-        raise ValueError(
-            f"The model spent all {max_tokens} tokens reasoning and never reached an answer. "
-            "Raise Max answer tokens, or use a model whose thinking can be switched off."
-        )
+    text, thought = _split_output(raw, strip)
+    if not text and strip and _opens_with_thinking(raw):
+        raise ValueError(_thinking_overflow_message(max_tokens, thinking))
     if not text:
         raise ValueError("The text encoder returned an empty answer")
     elapsed = time.perf_counter() - started
     _log(
-        "finished in %.1fs (%d tokens, %.1f tokens/s, %d chars)",
+        "finished in %.1fs (%d tokens, %.1f tokens/s, %d chars%s)",
         elapsed, len(ids), len(ids) / elapsed if elapsed > 0 else 0.0, len(text),
+        f", {len(thought)} chars of reasoning set aside" if thought else "",
     )
-    return text
+    return text, thought
 
 
 # --------------------------------------------------------------------------- #
@@ -3094,8 +3273,12 @@ def _generate(
     transcript: str = "",
     executing: bool = False,
     request_id: str = "",
-) -> str:
-    """Run one question through the configured backend.
+) -> tuple[str, str]:
+    """Run one question through the configured backend: `(answer, reasoning)`.
+
+    The reasoning is what **Model thinking = Hide** (or a server that separates
+    it on its own) kept out of the answer, as plain text; "" otherwise. Only
+    `LLMWidget.run` has somewhere to put it — the `thinking` output.
 
     `media_items` are already-resolved parts, so the same pipeline serves the
     editor route (file paths) and node execution (tensors). `transcript` is the
@@ -3369,7 +3552,9 @@ def _register_routes() -> bool:
             # generation instead of only freeing the editor.
             should_stop = (lambda: _is_cancelled(request_id)) if request_id else None
             _raise_if_cancelled(request_id)
-            answer = await asyncio.to_thread(
+            # The reasoning has no home in the editor: the widget holds the
+            # answer, and the `thinking` output only exists during execution.
+            answer, _ = await asyncio.to_thread(
                 _generate, settings, system, question, items, should_stop, transcript, False, request_id,
             )
             # An HTTP request cannot be interrupted mid-flight, so a late cancel
@@ -3479,8 +3664,12 @@ def _execution_media_items(
 class LLMWidget:
     CATEGORY = "LLM Widget"
     FUNCTION = "run"
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("text",)
+    RETURN_TYPES = ("STRING", "STRING")
+    # `thinking` is the reasoning that Model thinking = Hide kept out of the
+    # answer. It is only ever produced by a generate_on_execute run: the widget
+    # stores the answer alone, so an execution that hands the stored answer on
+    # has nothing to put there.
+    RETURN_NAMES = ("text", "thinking")
     # Deliberately not an OUTPUT_NODE: this is a tool, not a step. An output
     # node would be pulled into every queued prompt even when nothing reads its
     # text, which is the opposite of a widget the user keeps muted.
@@ -3535,7 +3724,7 @@ class LLMWidget:
                     LOG_PREFIX + "the answer is empty. Click the run button on the node, "
                     "or enable generate_on_execute."
                 )
-            return (_last_answer(stored),)
+            return (_last_answer(stored), "")
         settings = _read_config()
         problem = _validate(settings)
         if problem:
@@ -3551,7 +3740,9 @@ class LLMWidget:
             _execution_media_items(connected, video, parts_format, str(settings.get("video_sample") or ""))
             if _as_bool(settings.get("read_media"), True) else []
         )
-        text = _generate(settings, str(system_prompt or ""), str(question), items, None, stored, executing=True)
+        text, thought = _generate(
+            settings, str(system_prompt or ""), str(question), items, None, stored, executing=True,
+        )
         # The editor gets the widget's new contents — the whole log in continue
         # mode — while the output socket carries the reply on its own.
         _notify_answer(
@@ -3559,7 +3750,7 @@ class LLMWidget:
             _append_turn(stored, str(question), text, _as_bool(settings.get("chat_blank_lines"), True))
             if _as_bool(settings.get("continue_chat")) else text,
         )
-        return (text,)
+        return (text, thought)
 
 
 _register_routes_when_ready()

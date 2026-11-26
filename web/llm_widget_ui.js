@@ -45,10 +45,14 @@ const FORMAT_LABELS = {
 };
 
 const THINKING_OFF = "off";
+// No switch is sent, but the tagged block is cut out of the answer and goes to
+// the node's `thinking` output under Generate on execute (see nodes.py).
+const THINKING_HIDE = "hide";
 const THINKING_KEEP = "keep";
-const THINKING_MODES = [THINKING_OFF, THINKING_KEEP];
+const THINKING_MODES = [THINKING_OFF, THINKING_HIDE, THINKING_KEEP];
 const THINKING_LABELS = {
     [THINKING_OFF]: "Off — ask the model not to reason",
+    [THINKING_HIDE]: "Hide — let the model reason, show only the answer",
     [THINKING_KEEP]: "Keep — show the reasoning in the answer",
 };
 
@@ -222,8 +226,10 @@ const TEXT = {
     thinking: "Model thinking",
     thinkingHint:
         "Off sends the switches each backend understands and removes any <think> block the model "
-        + "returns anyway. Reasoning that is emitted as plain prose cannot be separated from the "
-        + "answer — if it still leaks, use the model's non-thinking variant.",
+        + "returns anyway. Hide sends no switch, so the model reasons, but the block is cut out of the "
+        + "answer; a \"Generate on execute\" run puts it on the node's thinking output instead. "
+        + "Reasoning that is emitted as plain prose cannot be separated from the answer — if it still "
+        + "leaks, use the model's non-thinking variant.",
     save: "Save",
     close: "Close",
     saved: "Settings saved",
@@ -253,7 +259,7 @@ const TEXT = {
     responsesHint:
         "OpenAI's /v1/responses endpoint, or a server that mirrors it (LM Studio, llama.cpp server, vLLM). "
         + "The path is completed automatically. A reasoning model's thinking stays in its own output items "
-        + "and is never shown, whatever Model thinking says.",
+        + "and never reaches the answer; Hide asks for its summary and puts it on the thinking output.",
     geminiHint: "Google's native generateContent endpoint. Videos are sent whole instead of as sampled frames.",
     tabPrefix: "Prompt",
     tabAdd: "New system prompt tab",

@@ -349,8 +349,20 @@ from that handler, because the worker thread outlives it and does that itself.
 
 ## Reasoning
 
-The `thinking` setting is `off` (default) or `keep`; `off` means *both* "send the switches" and
-"strip what comes back". Three mistakes were made here already — do not reintroduce any of them:
+The `thinking` setting is `off` (default), `hide` or `keep`. `off` means *both* "send the
+switches" and "strip what comes back"; `hide` sends no switch — the model reasons at its default —
+and strips; `keep` does neither. Every backend reads it through `_thinking_mode` and splits it into
+`switch_off` (`== off`) and `strip` (`!= keep`); do not collapse those back into one boolean.
+`_split_output` does the stripping and returns `(answer, thought)`, and the whole pipeline
+(`_gguf_chat`, `_http_generate`, `_clip_generate`, `_generate`) returns that pair: the thought is
+the node's second output, `thinking`, and only a `generate_on_execute` run fills it — the route
+discards it, and the widget stores the answer alone, so a run that hands the stored answer on
+returns `""` there. Reasoning a server returns *beside* the text (`reasoning_content` on chat
+completions, `reasoning` items on Responses, Gemini's `thought` parts) goes to the same output
+whatever the mode, because it was never in the answer; under `hide` the request asks for it
+(`_thinking_payload`: Gemini `includeThoughts`, Responses `reasoning.summary`) through the same
+retry-without path as the off switches. Three mistakes were made here already — do not
+reintroduce any of them:
 
 1. **`_http_generate` originally sent nothing at all.** Only the GGUF path had `/no_think`, so any
    OpenAI-compatible server reasoned freely into the answer. The switches now go through
@@ -377,10 +389,11 @@ Untagged reasoning cannot be removed: nothing marks where it ends. Do not add he
 guess at prose preambles — they will eat real answers. The switches are what has to work; the
 honest fallback is telling the user to pick a non-thinking model.
 
-A block that never closes means the model ran out of tokens while thinking, and `_clean_output`
-returns "" because there genuinely is no answer in it. `_gguf_chat` turns that specific case into
-an error that says so (`_opens_with_thinking`) instead of an unexplained empty answer: the user
-can act on "raise Max answer tokens", not on "empty".
+A block that never closes means the model ran out of tokens while thinking, and `_split_output`
+returns an empty answer because there genuinely is none in it. Every backend turns that specific
+case into an error that says so (`_opens_with_thinking` → `_thinking_overflow_message`) instead of
+an unexplained empty answer: the user can act on "raise Max answer tokens", or under `hide` on
+"set Model thinking to Off", not on "empty".
 
 `_clean_output` unwraps a whole-answer code fence **only** for languages in `_PLAIN_FENCE_LANGS`
 (`json` is one of them: a model asked for JSON fences it, and the consumer wants the document).
@@ -469,8 +482,8 @@ node.properties["llmw_system_tab_index"] = open tab
 
 Constants duplicated between `nodes.py` and `web/llm_widget_ui.js` must be edited in both: the
 route paths under `/llm_widget/`, `ANSWER_EVENT`, `TOKEN_HEADER`, the five format ids and `LOCAL_FORMATS`, `GGUF_MMPROJ_AUTO` /
-`GGUF_MMPROJ_NONE`, `CHAT_USER_MARK` / `CHAT_MODEL_MARK`, the `VIDEO_SAMPLES` ids, `IMAGE_INPUT_MAX` with the socket
-naming (`image`, `image2`, …), and every
+`GGUF_MMPROJ_NONE`, `CHAT_USER_MARK` / `CHAT_MODEL_MARK`, the `THINKING_MODES` ids, the `VIDEO_SAMPLES` ids,
+`IMAGE_INPUT_MAX` with the socket naming (`image`, `image2`, …), and every
 settings key with its clamp range (both sides normalize independently, and the server's
 normalization is authoritative). `allowed_api_urls` is the exception: the JS only displays what
 `GET /settings` returns and never sends it, so its default lives in `nodes.py` alone.

@@ -86,6 +86,7 @@ C:\AI\ComfyUI\python_embeded\python.exe -c "from llama_cpp.llama_chat_format imp
 | `image`, `image2` … `image10`（入力） | `IMAGE` | 任意。モデルには **スロット番号** で `image 1` … `image 10` として渡ります（`image2` を空けても `image3` は `image 3` のまま）。複数の参照画像を番号で指す編集モデル向けのプロンプトを書かせるときは、その番号で質問してください |
 | `video`（入力） | `VIDEO` | 任意 |
 | `text`（出力） | `STRING` | 任意 — 通常は未使用。*実行時の動作* を参照 |
+| `thinking`（出力） | `STRING` | 任意 — **Model thinking = Hide** のときに答えから切り離した思考。`generate_on_execute` の実行でだけ中身が入り、それ以外は空文字です — *推論（thinking）* を参照 |
 
 ウィジェット:
 
@@ -145,7 +146,9 @@ Reroute ノードは辿って追跡します。
 
 ヘッドレス実行や API 実行のときはオンにしてください。質問は実行中に、実際の `IMAGE` / `VIDEO`
 テンソルを使って（ファイルは不要）処理され、結果は出力に流れると同時にノードの `answer`
-ウィジェットにも書き戻されます。
+ウィジェットにも書き戻されます。**Model thinking = Hide** で答えから切り離した思考は、このときだけ
+`thinking` 出力に流れます（ウィジェットに保存されるのは答えだけなので、保存済みの答えを渡す
+だけの実行では空文字です）。
 
 `question` や `system_prompt` を別ノードの出力から受け取るのもこのモードの話です。✦ はグラフを
 実行しないので、上流ノードの出力はその時点では存在せず、✦ が送るのはノードに保存されている
@@ -171,7 +174,7 @@ Reroute ノードは辿って追跡します。
 | GPU layers | gguf | `n_gpu_layers`。`-1` で全レイヤーをオフロード |
 | Text encoder | clip | `models/text_encoders` の `.safetensors` — *ComfyUI のテキストエンコーダを LLM として使う* を参照 |
 | Speculative decoding (MTP) | clip | `Auto`（既定）または `Off`。MTP ヘッド付きのエンコーダで ComfyUI 0.45 以降が行う投機的デコードを止めます |
-| Model thinking | 全て | `Off`（既定）または `Keep` — *推論（thinking）* を参照 |
+| Model thinking | 全て | `Off`（既定）、`Hide`、`Keep` — *推論（thinking）* を参照 |
 | Temperature | 全て | |
 | Max answer tokens | 全て | ローカルバックエンドでは `max_tokens`。答えの長さの上限 |
 | Continue the conversation | 全て | 前回までのやり取りも一緒に送ります — *会話を続ける* を参照 |
@@ -390,6 +393,15 @@ Qwen3.8 はオン／オフのスイッチを **深さ** に変えました。テ
 続くもの）は答えと分離できません。どこで終わるのかを示すものが何もないからです。スイッチを
 送ってもこの形で漏れるモデルなら、その non-thinking 版を使ってください。
 
+**Hide** はスイッチを送らず（モデルは既定どおり考えます）、除去だけを行います。考えさせたいが
+答えには混ぜたくない、というときの設定です。切り離した思考は捨てずに、`generate_on_execute` の
+実行ではノードの `thinking` 出力に流します（✦ からの実行では置き場所が無いので捨てます）。
+サーバーが思考を本文とは別に返す形式 — chat completions の `reasoning_content`、Responses API の
+`reasoning` アイテム、Gemini の `thought` パーツ — は、元々答えに含まれていないので、モードに
+関係なく同じ出力に載ります。Hide ではそれを返すよう頼むフィールド（Gemini の `includeThoughts`、
+Responses API の `reasoning.summary`）も送り、推論を持たないモデルがそれを拒否した場合は Off の
+スイッチと同じ経路で外して再送します。マーカーの無い思考は Keep と同様に分離できません。
+
 **Keep** はスイッチを一切送らず、除去も行いません。推論を読みたいときに使います。
 
 答え全体がコードフェンスで囲まれていた場合、それを外すのは言語指定がないか、散文的な言語
@@ -547,6 +559,7 @@ it back with `pip install --upgrade "numpy<2.3"` (same idea for `"pillow<12"`).
 | `image`, `image2` … `image10` (input) | `IMAGE` | optional. The model receives them as `image 1` … `image 10` by **socket number** (`image3` stays `image 3` with `image2` left empty), so refer to them by that number when asking for a prompt for a multi-reference edit model |
 | `video` (input) | `VIDEO` | optional |
 | `text` (output) | `STRING` | optional — normally unused, see *Execution* |
+| `thinking` (output) | `STRING` | optional — the reasoning **Model thinking = Hide** kept out of the answer. Filled by a `generate_on_execute` run only, "" otherwise — see *Reasoning* |
 
 Widgets:
 
@@ -605,7 +618,9 @@ the editor.
 
 Turn it on for a headless or API run. The question is then answered during execution, using
 the actual `IMAGE`/`VIDEO` tensors (no file needed), and the result is pushed back into the
-node's `answer` widget as well as onto the output.
+node's `answer` widget as well as onto the output. This is also the only time the `thinking`
+output carries anything: the reasoning **Model thinking = Hide** cut out of the answer. The
+widget stores the answer alone, so a run that just hands the stored answer on leaves it "".
 
 Feeding `question` or `system_prompt` from another node belongs to this mode too. ✦ does not
 execute the graph, so the upstream output does not exist yet and ✦ keeps sending the text
@@ -631,7 +646,7 @@ API key** and is gitignored.
 | GPU layers | gguf | `n_gpu_layers`, `-1` offloads everything |
 | Text encoder | clip | A `.safetensors` under `models/text_encoders` — see *Using a ComfyUI text encoder as the LLM* |
 | Speculative decoding (MTP) | clip | `Auto` (default) or `Off`. Turns off the speculative decoding ComfyUI 0.45+ does through an encoder's MTP head |
-| Model thinking | all | `Off` (default) or `Keep` — see *Reasoning* |
+| Model thinking | all | `Off` (default), `Hide` or `Keep` — see *Reasoning* |
 | Temperature | all | |
 | Max answer tokens | all | `max_tokens` for the local backends, the answer length cap |
 | Continue the conversation | all | Send the earlier turns along with the question — see *Continuing the conversation* |
@@ -858,6 +873,16 @@ their reasoning with channels instead of tags are handled the same way: Harmony'
 Reasoning that carries **no marker at all** ("Here's a thinking process: 1. Analyze user
 input…" as plain text) cannot be separated from the answer — nothing says where it stops.
 If a model leaks like that despite the switches, use its non-thinking variant.
+
+**Hide** sends no switch — the model reasons at its default — and only strips, for when you
+want the model to think but not in the answer. The stripped thought is not thrown away: a
+`generate_on_execute` run puts it on the node's `thinking` output (a ✦ run has nowhere to put
+it and drops it). Reasoning a server returns *beside* the text — `reasoning_content` on chat
+completions, the `reasoning` items of the Responses API, Gemini's `thought` parts — was never in
+the answer, so it goes to that output whatever the mode; under Hide the request also asks for
+it (Gemini's `includeThoughts`, the Responses API's `reasoning.summary`), and a model without
+reasoning that rejects the field gets the request again without it, the same way the Off
+switches are retried. Reasoning with no marker cannot be separated, exactly as under Keep.
 
 **Keep** sends none of the switches and strips nothing, for when you want to read the
 reasoning.
