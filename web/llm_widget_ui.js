@@ -2092,7 +2092,7 @@ function installStyle() {
          model path is enough to push the dialog into a horizontal scrollbar. */
       .llmw-form { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 14px 20px 16px; }
       .llmw-row { display: flex; flex-direction: column; align-items: stretch; gap: 5px; min-width: 0; min-height: 0; }
-      .llmw-row[hidden], .llmw-check[hidden], .llmw-hint[hidden] { display: none !important; }
+      .llmw-row[hidden], .llmw-check[hidden], .llmw-hint[hidden], .llmw-select-menu[hidden] { display: none !important; }
       .llmw-label { color: var(--llmw-muted); font-size: 13px; font-weight: 500; }
       .llmw-hint { min-width: 0; margin: -2px 0 2px; color: var(--llmw-muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
       .llmw-control {
