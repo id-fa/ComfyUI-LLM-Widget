@@ -2064,7 +2064,11 @@ def _is_gemma_name(model_name: str) -> bool:
 # switch, so a 3.5 model rendered through it simply thinks - through the whole
 # answer budget - which is how "qwen3.5" matching "qwen3" cost 8192 tokens of
 # reasoning and no answer. The dot is required: "qwen3-8b" is Qwen3.
-_QWEN35_NAME_RE = re.compile(r"qwen3\.[5-9]")
+# Prism ML's Ternary Bonsai models (`Ternary-Bonsai-2-27B-Q2_0.gguf`) are
+# ternary quantizations of Qwen3.6 (the unnumbered Bonsai) and Qwen3.8 (Bonsai
+# 2 / 2.5), all of them in this family, and their file names never say "qwen",
+# so they fell through to the LLaVA handler and the thought leaked whole.
+_QWEN35_NAME_RE = re.compile(r"qwen3\.[5-9]|bonsai")
 
 
 def _gguf_handler_candidates(model_name: str) -> tuple[str, ...]:

@@ -368,7 +368,9 @@ llama-cpp-python のバージョンに依存しません。llama-cpp-python 0.4.
 そのクラスが持つスイッチ（0.4.x では `enable_thinking=False`、旧 Qwen handler では
 `force_reasoning=False`）をコンストラクタで渡し、**Keep** のターンではターンごとに戻します。
 handler の族はファイル名から選びますが、`qwen3.5` / `qwen3.6` … は Qwen3-VL 用ではなく
-Qwen3.5 用を選びます。Qwen3-VL のテンプレートには切るべきスイッチがありません。
+Qwen3.5 用を選びます。Qwen3-VL のテンプレートには切るべきスイッチがありません。名前に `bonsai`
+を含むもの（Prism ML の Ternary Bonsai。無印は Qwen3.6、Bonsai 2 / 2.5 は Qwen3.8 の三値量子化）
+も Qwen3.5 系として扱います。ファイル名に `qwen` が無いので、そのままでは LLaVA 用に落ちて思考が丸ごと漏れていました。
 
 Qwen3.8 はオン／オフのスイッチを **深さ** に変えました。テンプレートが読むのは `reasoning_effort`
 で、既定は `xhigh` です。そのため `chat_template_kwargs` には `enable_thinking=false` と一緒に
@@ -834,7 +836,10 @@ turn *with* media goes through the vision chat handler, which renders its own te
 constructed with whichever switch its class declares (`enable_thinking=False` on 0.4.x,
 `force_reasoning=False` on the older Qwen handlers); a **Keep** turn flips it back per turn.
 The handler family is chosen from the filename, and `qwen3.5` / `qwen3.6` / … pick the Qwen3.5
-handler rather than the Qwen3-VL one, whose template has no switch to turn.
+handler rather than the Qwen3-VL one, whose template has no switch to turn. A name containing
+`bonsai` (Prism ML's Ternary Bonsai: the unnumbered one is a ternary quantization of Qwen3.6,
+Bonsai 2 / 2.5 of Qwen3.8) is treated as Qwen3.5-family too: it never says `qwen`, so it used to fall through to the LLaVA handler and the
+whole thought leaked.
 
 Qwen3.8 turned that on/off switch into a **depth**: its template reads `reasoning_effort`
 and defaults to `xhigh`. `chat_template_kwargs` therefore carries `reasoning_effort=low` —
