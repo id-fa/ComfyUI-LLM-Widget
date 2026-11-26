@@ -243,6 +243,8 @@ const TEXT = {
     emptyQuestion: "Type a question first",
     ggufEmpty: "No .gguf found under models/text_encoders or models/LLM",
     ggufAuto: "auto (next to the model)",
+    filterOptions: "Type to filter…",
+    noMatch: "No match",
     ggufNone: "none (text only)",
     ggufHint:
         "Runs locally through llama-cpp-python. Reading an image needs a matching mmproj projector; "
@@ -589,7 +591,7 @@ function makeRow(labelText, control) {
     return row;
 }
 
-function makeSelect(initialValue, onChange = null, optionList = null) {
+function makeSelect(initialValue, onChange = null, optionList = null, { filter = false } = {}) {
     const root = document.createElement("div");
     root.className = "llmw-select-wrap";
     const trigger = document.createElement("button");
@@ -603,29 +605,47 @@ function makeSelect(initialValue, onChange = null, optionList = null) {
     chevron.className = "llmw-select-chevron";
     const menu = document.createElement("div");
     menu.className = "llmw-select-menu";
-    menu.setAttribute("role", "listbox");
     menu.hidden = true;
+    // With `filter`, a text box sits above the list and narrows it as the user
+    // types: a models/ folder with dozens of GGUFs is not browsable by scrolling.
+    // Every word typed has to occur somewhere in the label (or value), in any order.
+    const filterInput = filter ? document.createElement("input") : null;
+    if (filterInput) {
+        filterInput.type = "text";
+        filterInput.className = "llmw-control llmw-select-filter";
+        filterInput.placeholder = TEXT.filterOptions;
+        filterInput.autocomplete = "off";
+        filterInput.spellcheck = false;
+        menu.append(filterInput);
+    }
+    const list = document.createElement("div");
+    list.className = "llmw-select-list";
+    list.setAttribute("role", "listbox");
+    menu.append(list);
     const options = optionList || FORMATS.map((value) => ({ value, label: FORMAT_LABELS[value] }));
     trigger.value = options.some((item) => item.value === initialValue) ? initialValue : options[0]?.value || "";
     let activeIndex = Math.max(0, options.findIndex((item) => item.value === trigger.value));
+    // Indexes into `options` of the entries the list currently shows.
+    let visible = options.map((_, index) => index);
 
+    const matches = (item, terms) => {
+        const haystack = `${item.label} ${item.value}`.toLowerCase();
+        return terms.every((term) => haystack.includes(term));
+    };
     const close = () => {
         menu.hidden = true;
         trigger.setAttribute("aria-expanded", "false");
         trigger.classList.remove("is-open");
     };
-    const open = () => {
-        menu.hidden = false;
-        trigger.setAttribute("aria-expanded", "true");
-        trigger.classList.add("is-open");
-    };
     const render = () => {
         const current = options.find((item) => item.value === trigger.value) || options[0];
         valueLabel.textContent = current?.label || "";
         valueLabel.title = current?.label || "";
-        for (const option of menu.querySelectorAll(".llmw-select-option")) {
+        for (const option of list.querySelectorAll(".llmw-select-option")) {
+            const index = Number(option.dataset.index);
             const selected = option.dataset.value === trigger.value;
             option.classList.toggle("is-selected", selected);
+            option.classList.toggle("is-active", index === activeIndex);
             option.setAttribute("aria-selected", selected ? "true" : "false");
         }
     };
@@ -640,19 +660,57 @@ function makeSelect(initialValue, onChange = null, optionList = null) {
         onChange?.(value);
     };
     const buildOptions = () => {
-        menu.textContent = "";
+        list.textContent = "";
+        const terms = String(filterInput?.value || "").toLowerCase().split(/\s+/).filter(Boolean);
+        visible = [];
         options.forEach((item, index) => {
+            if (terms.length && !matches(item, terms)) return;
+            visible.push(index);
             const option = document.createElement("button");
             option.type = "button";
             option.className = "llmw-select-option";
             option.dataset.value = item.value;
+            option.dataset.index = String(index);
             option.setAttribute("role", "option");
             option.textContent = item.label;
             option.title = item.label;
             option.addEventListener("click", () => choose(item.value));
-            option.addEventListener("pointerenter", () => { activeIndex = index; });
-            menu.append(option);
+            option.addEventListener("pointerenter", () => { activeIndex = index; render(); });
+            list.append(option);
         });
+        if (!visible.length) {
+            const empty = document.createElement("div");
+            empty.className = "llmw-select-empty";
+            empty.textContent = TEXT.noMatch;
+            list.append(empty);
+        }
+        // The highlight has to sit on a row that is on screen, or Enter picks
+        // something the filter hid.
+        if (!visible.includes(activeIndex)) activeIndex = visible[0] ?? -1;
+        render();
+    };
+    const scrollActiveIntoView = () => {
+        list.querySelector(".llmw-select-option.is-active")?.scrollIntoView?.({ block: "nearest" });
+    };
+    const open = (seed = "") => {
+        if (filterInput) {
+            filterInput.value = seed;
+            activeIndex = Math.max(0, options.findIndex((item) => item.value === trigger.value));
+            buildOptions();
+        }
+        menu.hidden = false;
+        trigger.setAttribute("aria-expanded", "true");
+        trigger.classList.add("is-open");
+        scrollActiveIntoView();
+        filterInput?.focus();
+    };
+    // Moves the highlight through the rows the filter left visible.
+    const step = (delta) => {
+        if (!visible.length) return;
+        const at = visible.indexOf(activeIndex);
+        activeIndex = visible[(Math.max(at, 0) + delta + visible.length) % visible.length];
+        render();
+        scrollActiveIntoView();
     };
     buildOptions();
     trigger.append(valueLabel, chevron);
@@ -665,13 +723,42 @@ function makeSelect(initialValue, onChange = null, optionList = null) {
         }
         if (event.key === "ArrowDown" || event.key === "ArrowUp") {
             event.preventDefault();
+            if (filterInput) {
+                // The filter box takes the keyboard from here on.
+                if (menu.hidden) open();
+                else step(event.key === "ArrowDown" ? 1 : -1);
+                return;
+            }
             if (menu.hidden) open();
             activeIndex = (activeIndex + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
             choose(options[activeIndex].value);
+            return;
         }
         if ((event.key === "Enter" || event.key === " ") && !menu.hidden) {
             event.preventDefault();
-            choose(options[activeIndex].value);
+            if (activeIndex >= 0) choose(options[activeIndex].value);
+            return;
+        }
+        // Typing on a closed filterable select opens it with that character
+        // already in the box, the way a native <select> jumps to a letter.
+        if (filterInput && menu.hidden && event.key.length === 1 && event.key !== " " && !event.ctrlKey && !event.metaKey && !event.altKey) {
+            event.preventDefault();
+            open(event.key);
+        }
+    });
+    filterInput?.addEventListener("input", buildOptions);
+    filterInput?.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            step(event.key === "ArrowDown" ? 1 : -1);
+        } else if (event.key === "Enter") {
+            // The box lives inside the settings <form>; a bare Enter would submit it.
+            event.preventDefault();
+            if (activeIndex >= 0 && visible.includes(activeIndex)) choose(options[activeIndex].value);
+        } else if (event.key === "Escape") {
+            event.preventDefault();
+            close();
+            trigger.focus();
         }
     });
     Object.defineProperty(root, "value", {
@@ -691,10 +778,9 @@ function makeSelect(initialValue, onChange = null, optionList = null) {
     root.setOptions = (next) => {
         options.length = 0;
         options.push(...next);
-        buildOptions();
         if (!options.some((item) => item.value === trigger.value)) trigger.value = options[0]?.value || "";
         activeIndex = Math.max(0, options.findIndex((item) => item.value === trigger.value));
-        render();
+        buildOptions();
     };
     render();
     return root;
@@ -830,12 +916,12 @@ async function openSettings() {
     const ggufGpuLayers = makeNumberInput(settingsCache.gguf_gpu_layers, -1, 1024, 1);
     const ggufModel = makeSelect(settingsCache.gguf_model, null, [
         { value: settingsCache.gguf_model, label: settingsCache.gguf_model || TEXT.ggufEmpty },
-    ]);
+    ], { filter: true });
     // The saved projector has to be in the list from the start. makeSelect drops
     // an initial value it cannot find and falls back to the first option, so
     // seeding only auto/none silently reset a configured projector to auto —
     // and the catalog fetch below then "restored" that reset value.
-    const ggufMmproj = makeSelect(settingsCache.gguf_mmproj, null, mmprojOptions(settingsCache.gguf_mmproj));
+    const ggufMmproj = makeSelect(settingsCache.gguf_mmproj, null, mmprojOptions(settingsCache.gguf_mmproj), { filter: true });
     const videoSample = makeSelect(settingsCache.video_sample, null, VIDEO_SAMPLES);
     const readMedia = makeSwitch(settingsCache.read_media, () => syncFormatRows());
     const continueChat = makeSwitch(settingsCache.continue_chat, () => syncFormatRows());
@@ -844,7 +930,7 @@ async function openSettings() {
     const ggufDescribe = makeSwitch(settingsCache.gguf_describe_media);
     const clipModel = makeSelect(settingsCache.clip_model, null, [
         { value: settingsCache.clip_model, label: settingsCache.clip_model || TEXT.clipEmpty },
-    ]);
+    ], { filter: true });
     const clipUnload = makeSwitch(settingsCache.clip_unload_after);
     const clipMtp = makeSelect(
         settingsCache.clip_mtp,
@@ -1065,6 +1151,14 @@ async function openSettings() {
     const onKeyDown = (event) => {
         if (event.key === "Escape") {
             event.preventDefault();
+            // This listener runs at capture, before the select sees the key: an
+            // open menu (and its filter box) takes the first Escape itself.
+            const openSelect = dialog.querySelector(".llmw-select.is-open")?.closest(".llmw-select-wrap");
+            if (openSelect) {
+                openSelect.closeMenu?.();
+                openSelect.focus?.();
+                return;
+            }
             requestClose();
         }
     };
@@ -2014,14 +2108,17 @@ function installStyle() {
       .llmw-select:hover .llmw-select-chevron, .llmw-select.is-open .llmw-select-chevron { border-color: var(--llmw-text); }
       .llmw-select.is-open .llmw-select-chevron { transform: rotate(225deg) translate(-1px, -1px); }
       .llmw-select-menu {
-        position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 100; max-height: 320px; overflow: auto; padding: 6px;
+        position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 100; display: flex; flex-direction: column; max-height: 320px; padding: 6px;
         border: 1px solid rgba(255,255,255,.08); border-radius: 12px; background: rgba(38,40,46,.97); box-shadow: 0 12px 32px rgba(0,0,0,.6);
       }
+      .llmw-select-list { min-height: 0; overflow: auto; }
+      .llmw-select-filter { flex: 0 0 auto; height: 30px; margin-bottom: 6px; padding: 5px 10px; font-size: 13px; }
+      .llmw-select-empty { padding: 8px 12px; color: var(--llmw-muted); font-size: 13px; }
       .llmw-select-option {
         display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; min-height: 34px; padding: 8px 12px; border: 0; border-radius: 8px;
         background: transparent; color: var(--llmw-text); cursor: pointer; font: inherit; font-size: 13px; text-align: left; transition: background .12s, color .12s;
       }
-      .llmw-select-option:hover { background: rgba(255,255,255,.06); }
+      .llmw-select-option:hover, .llmw-select-option.is-active { background: rgba(255,255,255,.06); }
       .llmw-select-option.is-selected { background: rgba(168,199,250,.1); color: var(--llmw-accent); font-weight: 500; }
       .llmw-select-option.is-selected::after { content: "\\2713"; margin-left: auto; }
       .llmw-check { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; min-height: 26px; font-size: 13px; }

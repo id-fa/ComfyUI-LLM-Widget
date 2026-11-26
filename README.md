@@ -165,7 +165,7 @@ Reroute ノードは辿って追跡します。
 | API key | openai / responses / gemini | `Authorization: Bearer` / `x-goog-api-key` として送信。openai / responses では省略可（ローカルサーバー向け。空ならヘッダー自体を送りません）、Gemini では必須 |
 | Model | openai / responses / gemini | Gemini では id 単体、`models/<id>`、モデルの完全な URL のいずれでも可 |
 | Request timeout (seconds) | openai / responses / gemini | サーバーが何も返さないまま待つ上限（10〜7200、既定 600）。✦ と `generate_on_execute` で共通 — *リクエストのタイムアウト* を参照 |
-| GGUF model | gguf | スキャン対象フォルダで見つかった `.gguf` |
+| GGUF model | gguf | スキャン対象フォルダで見つかった `.gguf`。一覧の上の欄に打ち込むと絞り込めます（空白区切りの語をすべて含むもの。Vision projector と Text encoder も同じ） |
 | Vision projector | gguf | `auto` はモデルの隣の最初の `mmproj*.gguf` を使用。`none` はテキストのみに固定 |
 | Context size | gguf | `n_ctx` |
 | GPU layers | gguf | `n_gpu_layers`。`-1` で全レイヤーをオフロード |
@@ -625,7 +625,7 @@ API key** and is gitignored.
 | API key | openai / responses / gemini | Sent as `Authorization: Bearer` / `x-goog-api-key`. Optional for openai / responses (a local server usually has none; empty means no header at all), required for Gemini |
 | Model | openai / responses / gemini | For Gemini a bare id, `models/<id>` or a full model URL are all accepted |
 | Request timeout (seconds) | openai / responses / gemini | How long the server may go without sending anything (10–7200, default 600). Shared by ✦ and `generate_on_execute` — see *Request timeout* |
-| GGUF model | gguf | Any `.gguf` found under the scanned folders |
+| GGUF model | gguf | Any `.gguf` found under the scanned folders. Typing in the box above the list narrows it to the names containing every word typed (Vision projector and Text encoder filter the same way) |
 | Vision projector | gguf | `auto` picks the first `mmproj*.gguf` next to the model; `none` forces text-only |
 | Context size | gguf | `n_ctx` |
 | GPU layers | gguf | `n_gpu_layers`, `-1` offloads everything |

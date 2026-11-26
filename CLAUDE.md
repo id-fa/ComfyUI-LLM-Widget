@@ -477,6 +477,9 @@ normalization is authoritative). `allowed_api_urls` is the exception: the JS onl
 
 ## Conventions
 
+- The dialog's dropdowns are `makeSelect`; a list that comes from a directory scan (GGUF model,
+  projector, text encoder) is built with `{ filter: true }`, which adds the type-to-filter box above
+  the rows. A fixed enum (format, thinking, video sampling) does not get it.
 - All user-visible UI text is English, in the `TEXT` table in the JS. There is no localization
   layer — MiniMax H3 Easy's homemade EN/ZH tables were deliberately not carried over.
 - Python log lines go through `_log` / `LOG_PREFIX` so a run that takes minutes shows progress.
