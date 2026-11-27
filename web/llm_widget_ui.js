@@ -135,6 +135,16 @@ const VIDEO_SAMPLES = Array.from(
     },
 );
 
+// Mirrors IMAGE_LIMITS in nodes.py: the pixel budget a connected image is
+// shrunk to before it is sent. Only an image above it is touched; "1 MP" is
+// 1024 x 1024. The values are the ids the server accepts.
+const IMAGE_LIMIT_OFF = "off";
+const IMAGE_LIMITS = [
+    { value: IMAGE_LIMIT_OFF, label: "Off (send as is)" },
+    { value: "1mp", label: "1 MP" },
+    { value: "2mp", label: "2 MP" },
+];
+
 const SETTINGS_DEFAULTS = Object.freeze({
     api_format: FORMAT_OPENAI,
     api_url: "",
@@ -142,6 +152,7 @@ const SETTINGS_DEFAULTS = Object.freeze({
     model: "",
     read_media: true,
     video_sample: VIDEO_SAMPLE_DEFAULT,
+    image_limit: IMAGE_LIMIT_OFF,
     thinking: THINKING_OFF,
     temperature: 0.35,
     max_length: MAX_LENGTH_DEFAULT,
@@ -215,6 +226,10 @@ const TEXT = {
         "A chat request has no video channel, so a connected video is sent as stills. Candidates are "
         + "taken at one per second; the first and the last frame are always kept and the rest of the "
         + "budget goes to the frames that changed most, with their timestamps stated in the request.",
+    imageLimit: "Shrink large images to",
+    imageLimitHint:
+        "A connected image with more pixels than this is scaled down to it (aspect kept) before it is "
+        + "sent; a smaller one is sent untouched. 1 MP is 1024 × 1024. Video frames have their own size.",
     continueChat: "Continue the conversation",
     historyTurns: "Exchanges kept in the history",
     chatBlankLines: "Blank line between the log entries",
@@ -314,6 +329,9 @@ function normalizeSettings(value) {
         model: String(source.model || "").trim(),
         read_media: asBoolean(source.read_media, true),
         video_sample: canonicalVideoSample(source.video_sample),
+        image_limit: IMAGE_LIMITS.some((item) => item.value === String(source.image_limit || "").toLowerCase())
+            ? String(source.image_limit).toLowerCase()
+            : IMAGE_LIMIT_OFF,
         thinking: THINKING_MODES.includes(String(source.thinking || "").toLowerCase())
             ? String(source.thinking).toLowerCase()
             : THINKING_OFF,
@@ -929,6 +947,7 @@ async function openSettings() {
     // and the catalog fetch below then "restored" that reset value.
     const ggufMmproj = makeSelect(settingsCache.gguf_mmproj, null, mmprojOptions(settingsCache.gguf_mmproj), { filter: true });
     const videoSample = makeSelect(settingsCache.video_sample, null, VIDEO_SAMPLES);
+    const imageLimit = makeSelect(settingsCache.image_limit, null, IMAGE_LIMITS);
     const readMedia = makeSwitch(settingsCache.read_media, () => syncFormatRows());
     const continueChat = makeSwitch(settingsCache.continue_chat, () => syncFormatRows());
     const chatBlankLines = makeSwitch(settingsCache.chat_blank_lines);
@@ -971,6 +990,10 @@ async function openSettings() {
     const ggufContextRow = makeRow(TEXT.ggufContext, ggufContext);
     const ggufGpuLayersRow = makeRow(TEXT.ggufGpuLayers, ggufGpuLayers);
     const readMediaRow = makeCheckRow(TEXT.readMedia, readMedia);
+    const imageLimitRow = makeRow(TEXT.imageLimit, imageLimit);
+    const imageLimitHint = document.createElement("p");
+    imageLimitHint.className = "llmw-hint";
+    imageLimitHint.textContent = TEXT.imageLimitHint;
     const videoSampleRow = makeRow(TEXT.videoSample, videoSample);
     const videoSampleHint = document.createElement("p");
     videoSampleHint.className = "llmw-hint";
@@ -1017,6 +1040,8 @@ async function openSettings() {
         ggufUnloadRow,
         clipUnloadRow,
         readMediaRow,
+        imageLimitRow,
+        imageLimitHint,
         ggufDescribeRow,
         videoSampleRow,
         videoSampleHint,
@@ -1082,6 +1107,8 @@ async function openSettings() {
         // So does how many frames a video is thinned to.
         videoSampleRow.hidden = !readMedia.checked;
         videoSampleHint.hidden = !readMedia.checked;
+        imageLimitRow.hidden = !readMedia.checked;
+        imageLimitHint.hidden = !readMedia.checked;
         // How much history to replay, and how the log is spaced, are only
         // questions once there is a log at all.
         historyTurnsRow.hidden = !continueChat.checked;
@@ -1120,6 +1147,7 @@ async function openSettings() {
         model: model.value,
         read_media: readMedia.checked,
         video_sample: videoSample.value,
+        image_limit: imageLimit.value,
         thinking: thinking.value,
         temperature: temperature.value,
         max_length: maxLength.value,

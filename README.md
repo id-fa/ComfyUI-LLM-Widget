@@ -182,6 +182,7 @@ Reroute ノードは辿って追跡します。
 | Blank line between the log entries | 全て | ログの各ブロックの間に空行を入れるか。オフで詰めた IRC ログになります |
 | Unload after answering | gguf / clip | モデルを常駐させず、すぐに VRAM を解放。オフのままでもツールバーの ⏏ でいつでも解放できます |
 | Send the connected image / video | 全て | オフにすると質問は純粋なテキストとして送られます |
+| Shrink large images to | 全て | 接続した画像の画素数がこの値（1 MP = 1024×1024、または 2 MP）を超えるときだけ、縦横比を保って縮小してから送ります。既定は Off（そのまま送る）。動画のフレームには別のサイズ上限があり、この設定は関係しません |
 | Video frames sent | 全て | 動画 1 本を何枚の静止画にするか（2〜12、既定 4）。Gemini はファイルをそのまま送るため無関係です |
 | Describe each media in its own pass | gguf | 下記参照 |
 
@@ -654,6 +655,7 @@ API key** and is gitignored.
 | Blank line between the log entries | all | Whether the log's blocks are separated by a blank line. Off gives a tight IRC log |
 | Unload after answering | gguf / clip | Frees VRAM immediately instead of keeping the model resident. Leave it off and use the toolbar's ⏏ when you want the VRAM back |
 | Send the connected image / video | all | Off means the question is asked as pure text |
+| Shrink large images to | all | A connected image is scaled down, aspect kept, only when it has more pixels than this (1 MP = 1024×1024, or 2 MP). Off by default (sent as is). Video frames have their own size cap and are not affected |
 | Video frames sent | all | How many stills one video becomes (2–12, default 4). Not used by Gemini, which gets the file whole |
 | Describe each media in its own pass | gguf | See below |
 

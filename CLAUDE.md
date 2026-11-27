@@ -128,6 +128,16 @@ An unresolvable media is *kept* as an item with empty `parts` so the run can rep
 skipped (`skipped` in the response, red struck-through chip in the toolbar) rather than silently
 answering about nothing. Do not "simplify" that by dropping the item.
 
+**`image_limit` (`off` / `1mp` / `2mp`, `IMAGE_LIMITS`)** is a pixel budget for a connected image,
+with 1 MP = 1024 × 1024. `_limited_image` applies it in `_media_items`, and an image at or below
+the budget is returned **byte for byte** — do not turn it into "re-encode everything as JPEG"
+(same reason as the LM Studio retry below: a lossy re-encode of every image is not free). A shrunk
+one becomes JPEG, or PNG when it has alpha, with the EXIF orientation applied first because the tag
+does not survive the re-encode; a file Pillow cannot read is sent as it is rather than skipped.
+During execution a single image tensor uses the same budget instead of `STILL_MAX_SIDE`, so ✦ and
+`generate_on_execute` send the same size; a multi-frame batch and video stills keep
+`STILL_MAX_SIDE`, and the clip backend's `CLIP_IMAGE_MAX_SIDE` still applies after it.
+
 ## Video sampling
 
 A chat message has no video channel, so a video becomes stills: `_video_still_parts` from a file,
@@ -482,7 +492,7 @@ node.properties["llmw_system_tab_index"] = open tab
 
 Constants duplicated between `nodes.py` and `web/llm_widget_ui.js` must be edited in both: the
 route paths under `/llm_widget/`, `ANSWER_EVENT`, `TOKEN_HEADER`, the five format ids and `LOCAL_FORMATS`, `GGUF_MMPROJ_AUTO` /
-`GGUF_MMPROJ_NONE`, `CHAT_USER_MARK` / `CHAT_MODEL_MARK`, the `THINKING_MODES` ids, the `VIDEO_SAMPLES` ids,
+`GGUF_MMPROJ_NONE`, `CHAT_USER_MARK` / `CHAT_MODEL_MARK`, the `THINKING_MODES` ids, the `VIDEO_SAMPLES` ids, the `IMAGE_LIMITS` ids,
 `IMAGE_INPUT_MAX` with the socket naming (`image`, `image2`, …), and every
 settings key with its clamp range (both sides normalize independently, and the server's
 normalization is authoritative). `allowed_api_urls` is the exception: the JS only displays what

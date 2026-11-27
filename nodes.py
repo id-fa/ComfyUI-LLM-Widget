@@ -182,6 +182,18 @@ VIDEO_SAMPLE_SCORE_SIDE = 48
 # What is said about the attached stills when their timestamps are unknown.
 VIDEO_SAMPLE_ORDER = "in chronological order"
 STILL_MAX_SIDE = 768
+# A connected image file is otherwise sent exactly as it is on disk, and a 4K
+# render is thousands of vision tokens (or a refused request) for an answer that
+# rarely needs them. The setting is a pixel budget: an image above it is scaled
+# down to it, aspect kept, and one at or below it is not touched at all - not
+# even re-encoded. "1 MP" is 1024 x 1024, the way image models count it, so a
+# 1024 px square passes through. Duplicated in the JS as IMAGE_LIMITS.
+IMAGE_LIMIT_OFF = "off"
+IMAGE_LIMITS: dict[str, int] = {
+    IMAGE_LIMIT_OFF: 0,
+    "1mp": 1024 * 1024,
+    "2mp": 2 * 1024 * 1024,
+}
 # How many frames of a connected IMAGE batch are attached during execution.
 IMAGE_BATCH_STILLS = 4
 # The node has this many IMAGE sockets: `image`, then `image2` … `image10`. The
@@ -250,6 +262,7 @@ CONFIG_DEFAULTS = {
     "model": "",
     "read_media": True,
     "video_sample": VIDEO_SAMPLE_DEFAULT,
+    "image_limit": IMAGE_LIMIT_OFF,
     "thinking": THINKING_OFF,
     "temperature": 0.35,
     "max_length": MAX_LENGTH_DEFAULT,
@@ -338,6 +351,9 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
     video_sample = str(source.get("video_sample") or "").strip().lower()
     if video_sample not in VIDEO_SAMPLES:
         video_sample = VIDEO_SAMPLE_DEFAULT
+    image_limit = str(source.get("image_limit") or "").strip().lower()
+    if image_limit not in IMAGE_LIMITS:
+        image_limit = IMAGE_LIMIT_OFF
     hosts = source.get("allowed_hosts")
     destinations = source.get(ALLOWED_API_URLS_KEY)
     if not isinstance(destinations, (list, tuple)):
@@ -352,6 +368,7 @@ def _normalize_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
         "model": str(source.get("model") or "").strip(),
         "read_media": _as_bool(source.get("read_media"), True),
         "video_sample": video_sample,
+        "image_limit": image_limit,
         "thinking": thinking,
         "temperature": round(temperature, 3),
         "max_length": integer("max_length", MAX_LENGTH_DEFAULT, MAX_LENGTH_MIN, MAX_LENGTH_LIMIT),
@@ -1045,14 +1062,76 @@ def _image_part(data: bytes, mime: str, api_format: str) -> dict[str, Any]:
     return {"type": "image_url", "image_url": {"url": data_url}}
 
 
-def _encode_pil(image, max_side: int = STILL_MAX_SIDE) -> bytes:
-    longest = max(image.width, image.height)
-    if longest > max_side:
-        scale = max_side / longest
-        image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))))
+def _image_limit_pixels(limit: str) -> int:
+    """The pixel budget of an `image_limit` setting; 0 means no limit."""
+    return IMAGE_LIMITS.get(str(limit or "").strip().lower(), 0)
+
+
+def _fit_pixels(image, max_pixels: int):
+    """`image` scaled down to at most `max_pixels`, aspect kept.
+
+    Returned as it came when it already fits. The sides are floored so the
+    result can never land a row above the budget it was shrunk to.
+    """
+    pixels = image.width * image.height
+    if max_pixels <= 0 or pixels <= max_pixels:
+        return image
+    scale = (max_pixels / float(pixels)) ** 0.5
+    return image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
+
+
+def _encode_pil(image, max_side: int = STILL_MAX_SIDE, max_pixels: int = 0) -> bytes:
+    """JPEG bytes of `image`, shrunk to `max_pixels` when given, else to `max_side`."""
+    if max_pixels > 0:
+        image = _fit_pixels(image, max_pixels)
+    else:
+        longest = max(image.width, image.height)
+        if longest > max_side:
+            scale = max_side / longest
+            image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))))
     buffer = io.BytesIO()
     image.convert("RGB").save(buffer, format="JPEG", quality=88)
     return buffer.getvalue()
+
+
+def _limited_image(data: bytes, mime: str, max_pixels: int, name: str = "") -> tuple[bytes, str]:
+    """An image file's bytes, shrunk to the `image_limit` budget when above it.
+
+    An image within the budget is returned byte for byte: the setting is a
+    ceiling, not a re-encode of everything that passes. A shrunk one comes back
+    as JPEG, or as PNG when it has transparency to keep. Anything Pillow cannot
+    read is sent as it is - the endpoint may still take it, and a failed shrink
+    must not turn into a skipped image.
+    """
+    if max_pixels <= 0:
+        return data, mime
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(data)) as source:
+            width, height = source.size
+            if width * height <= max_pixels:
+                return data, mime
+            # The orientation tag does not survive the re-encode, so it is
+            # applied to the pixels first.
+            image = ImageOps.exif_transpose(source)
+            alpha = image.mode in {"RGBA", "LA", "PA"} or "transparency" in image.info
+            image = _fit_pixels(image.convert("RGBA" if alpha else "RGB"), max_pixels)
+            buffer = io.BytesIO()
+            if alpha:
+                image.save(buffer, format="PNG")
+                shrunk_mime = "image/png"
+            else:
+                image.save(buffer, format="JPEG", quality=90)
+                shrunk_mime = "image/jpeg"
+    except Exception as exc:
+        logging.warning(LOG_PREFIX + "could not shrink %s (%s); sending it as it is.", name or "an image", exc)
+        return data, mime
+    _log(
+        "shrunk %s from %dx%d to %dx%d (%.1f MP limit)",
+        name or "an image", width, height, image.width, image.height, max_pixels / float(1024 * 1024),
+    )
+    return buffer.getvalue(), shrunk_mime
 
 
 def _video_sample_count(sample: str) -> int:
@@ -1290,11 +1369,14 @@ def _video_still_parts(
     return parts, times, duration
 
 
-def _tensor_parts(frames, indexes: Sequence[int], api_format: str) -> list[dict[str, Any]]:
+def _tensor_parts(
+    frames, indexes: Sequence[int], api_format: str, max_pixels: int = 0,
+) -> list[dict[str, Any]]:
     """Encode the named frames of an IMAGE/VIDEO tensor as image parts.
 
     Used only during execution, where media arrives as tensors instead of the
-    file paths the editor route reports.
+    file paths the editor route reports. `max_pixels` replaces the still side
+    cap with the `image_limit` budget.
     """
     try:
         import numpy
@@ -1306,17 +1388,22 @@ def _tensor_parts(frames, indexes: Sequence[int], api_format: str) -> list[dict[
         try:
             array = frames[index][..., :3].detach().cpu().numpy()
             image = Image.fromarray(numpy.clip(array * 255.0, 0, 255).astype(numpy.uint8))
-            parts.append(_image_part(_encode_pil(image), "image/jpeg", api_format))
+            parts.append(_image_part(_encode_pil(image, max_pixels=max_pixels), "image/jpeg", api_format))
         except Exception as exc:
             logging.warning(LOG_PREFIX + "could not encode a frame (%s).", exc)
     return parts
 
 
-def _tensor_still_parts(frames, api_format: str, count: int) -> list[dict[str, Any]]:
+def _tensor_still_parts(frames, api_format: str, count: int, max_pixels: int = 0) -> list[dict[str, Any]]:
     """Encode evenly spaced frames of an IMAGE batch as image parts.
 
     A batch is not a clip: its frames have no timeline to reason about, so they
     are thinned evenly rather than by how much they changed.
+
+    `max_pixels` is the `image_limit` budget and applies to a single image only,
+    so that the same picture is sent at the same size whether it arrived as a
+    file from the editor or as a tensor here. Several frames of one batch keep
+    the still cap: they are sent together and the budget is per image.
     """
     try:
         total = int(frames.shape[0])
@@ -1325,7 +1412,7 @@ def _tensor_still_parts(frames, api_format: str, count: int) -> list[dict[str, A
     if total <= 0:
         return []
     indexes = [min(total - 1, int(index * total / max(1, min(count, total)))) for index in range(min(count, total))]
-    return _tensor_parts(frames, indexes, api_format)
+    return _tensor_parts(frames, indexes, api_format, max_pixels if len(indexes) == 1 else 0)
 
 
 def _tensor_change_scores(frames, indices: Sequence[int]) -> list[float]:
@@ -1399,6 +1486,7 @@ def _media_items(
     resources: Sequence[Mapping[str, Any]],
     api_format: str,
     sample: str = VIDEO_SAMPLE_DEFAULT,
+    image_limit: str = IMAGE_LIMIT_OFF,
 ) -> list[dict[str, Any]]:
     """Resolve the editor's media list into taggable request parts.
 
@@ -1437,7 +1525,12 @@ def _media_items(
                 mime = mimetypes.guess_type(path)[0] or {"image": "image/jpeg", "video": "video/mp4"}[media_type]
                 if api_format == FORMAT_GEMINI or media_type == "image":
                     with open(path, "rb") as handle:
-                        parts = [_image_part(handle.read(), mime, api_format)]
+                        data = handle.read()
+                    if media_type == "image":
+                        data, mime = _limited_image(
+                            data, mime, _image_limit_pixels(image_limit), os.path.basename(path),
+                        )
+                    parts = [_image_part(data, mime, api_format)]
         except (OSError, ValueError):
             parts = []
         sampled = not parts and media_type == "video"
@@ -3545,6 +3638,7 @@ def _register_routes() -> bool:
             items = (
                 await asyncio.to_thread(
                     _media_items, resources, parts_format, str(settings.get("video_sample") or ""),
+                    str(settings.get("image_limit") or ""),
                 )
                 if _as_bool(settings.get("read_media"), True) else []
             )
@@ -3623,6 +3717,7 @@ def _execution_media_items(
     video,
     api_format: str,
     sample: str = VIDEO_SAMPLE_DEFAULT,
+    image_limit: str = IMAGE_LIMIT_OFF,
 ) -> list[dict[str, Any]]:
     """Build request parts from the tensors an execution actually receives.
 
@@ -3634,7 +3729,9 @@ def _execution_media_items(
         image = images[number]
         if image is None:
             continue
-        parts = _tensor_still_parts(image, api_format, IMAGE_BATCH_STILLS)
+        parts = _tensor_still_parts(
+            image, api_format, IMAGE_BATCH_STILLS, _image_limit_pixels(image_limit),
+        )
         items.append({
             "tag": f"image {number}", "type": "image", "path": "", "parts": parts,
             "sampled": len(parts) > 1, "times": [], "duration": 0.0,
@@ -3737,7 +3834,10 @@ class LLMWidget:
             number: images.get(_image_input_name(number)) for number in range(1, IMAGE_INPUT_MAX + 1)
         }
         items = (
-            _execution_media_items(connected, video, parts_format, str(settings.get("video_sample") or ""))
+            _execution_media_items(
+                connected, video, parts_format, str(settings.get("video_sample") or ""),
+                str(settings.get("image_limit") or ""),
+            )
             if _as_bool(settings.get("read_media"), True) else []
         )
         text, thought = _generate(
